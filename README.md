@@ -170,6 +170,73 @@ correct date to extract in the first place.
 
 ## 5. How it works — step by step, per URL
 
+### Flow diagram
+
+Blue = deterministic code (regex/API lookups, no LLM). Purple = LLM reasoning
+(Groq). Orange = a real browser is involved. Gray = skipped/no-op. Every path
+converges on the first successful **Return result** — nothing further runs
+once a date is found.
+
+```mermaid
+flowchart TD
+    A([Provenance URL]) --> B{Catalog / browse<br/>page pattern?}
+    B -->|yes| SKIP1([Skip — no single<br/>dataset date exists])
+    B -->|no| C{datacommons.org?}
+    C -->|yes| SKIP2([Skip — not externally<br/>trackable])
+    C -->|no| D{Matches a Tier 0<br/>domain handler?}
+
+    D -->|Wikidata homepage| D1[Redirect to<br/>query.wikidata.org]
+    D1 --> T1
+    D -->|NASA / HUMDATA / NDAP /<br/>GitHub / EPA FTP| D2[Call that source's<br/>own authoritative API]
+    D2 -->|date found| RETURN([Return result])
+    D2 -->|nothing found| T1
+    D -->|no match| T1
+
+    subgraph Parallel["Tiers 1 + 2 run concurrently"]
+        T1[Tier 1 — HTTP HEAD<br/>Last-Modified header]
+        T2[Tier 2 — GET + parse HTML<br/>JSON-LD / meta tags / body-text regex<br/>+ follow top 6 promising sub-links]
+    end
+
+    T2 -->|date found| RETURN
+    T1 -->|Last-Modified found AND<br/>Tier 2 totally failed| RETURN
+    T2 -->|nothing found,<br/>but HTML was fetched| T3
+    T2 -->|nothing found,<br/>no HTML at all| NONE([No date found])
+
+    T3[Tier 3 — Groq LLM reasons<br/>over page text, decoy-aware prompt]
+    T3 -->|date found| RETURN
+    T3 -->|nothing found| T4
+
+    T4[Tier 4 — Playwright renders<br/>page in headless Chromium]
+    T4 --> T4CHECK{Date in<br/>rendered HTML?}
+    T4CHECK -->|yes| RETURN
+    T4CHECK -->|no| T4B[Groq LLM on<br/>rendered page text]
+    T4B -->|date found| RETURN
+    T4B -->|nothing found| T5
+
+    T5[Tier 5 — Groq compound-beta<br/>agent browses the URL itself]
+    T5 -->|date found| RETURN
+    T5 -->|nothing found| T6
+
+    T6{URL matches Census<br/>tid=ACSST5Y-year pattern?}
+    T6 -->|yes| T6B[Read vintage year<br/>straight from the URL]
+    T6B --> RETURN
+    T6 -->|no| NONE
+
+    classDef deterministic fill:#1f6feb,color:#fff,stroke:#1f6feb
+    classDef llm fill:#8957e5,color:#fff,stroke:#8957e5
+    classDef browser fill:#bf8700,color:#fff,stroke:#bf8700
+    classDef terminal fill:#238636,color:#fff,stroke:#238636
+    classDef skip fill:#6e7681,color:#fff,stroke:#6e7681
+
+    class D2,T1,T2,T6,T6B deterministic
+    class T3,T4B llm
+    class T4,T5 browser
+    class RETURN terminal
+    class SKIP1,SKIP2,NONE skip
+```
+
+### Step-by-step
+
 For a single URL, the pipeline tries the following in order and **stops at
 the first success**:
 
