@@ -16,6 +16,7 @@ Run:
 
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
@@ -43,6 +44,39 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from groq import Groq as _Groq
 _groq_client = _Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+
+# ── logging ───────────────────────────────────────────────────────────────────
+# Every tier previously swallowed its own exceptions with a bare `except: pass`,
+# so a broken credential or a rate-limit block looked identical to "genuinely
+# no date found" — this is exactly how the invalid GEMINI_API_KEY went
+# unnoticed for an unknown period. logger.debug() calls below make the real
+# reason visible in the per-run log file without changing any tier's
+# fall-through behavior (a failure still means "try the next tier").
+logger = logging.getLogger("refresh_pipeline")
+
+LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
+
+
+def setup_logging(log_path: str | None = None) -> str:
+    """Configures `logger` to write DEBUG-level detail to a per-run file
+    (every fetch, every tier decision, every LLM prompt/response, every
+    caught exception with its real type+message) while keeping the existing
+    console print() output as the at-a-glance progress view. Returns the
+    resolved log file path."""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    if log_path is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(LOGS_DIR, f"run_{ts}.log")
+
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()  # avoid duplicate handlers if setup_logging is called twice in one process
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
+    return log_path
+
 
 # ── config ────────────────────────────────────────────────────────────────────
 
@@ -292,20 +326,25 @@ def _extract_from_html(html: str, url: str) -> tuple[str | None, str, str | None
 
 async def _tier1(session: aiohttp.ClientSession, url: str) -> dict | None:
     if urlparse(url).path.lower().endswith(tuple(_SKIP_LASTMOD_EXTS)):
+        logger.debug(f"tier1 {url}: skipped (binary extension)")
         return None
     try:
         async with session.head(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TO),
                                  allow_redirects=True, headers=HEADERS) as r:
+            logger.debug(f"tier1 {url}: HEAD -> status={r.status}")
             lm = r.headers.get("Last-Modified") or r.headers.get("X-Last-Modified")
             if lm:
                 val = _parse_date(lm)
                 if val:
                     days_old = (_date.today() - _date.fromisoformat(val)).days
                     if days_old < 14:
+                        logger.debug(f"tier1 {url}: Last-Modified={val} rejected (only {days_old}d old, likely dynamic regen)")
                         return None  # likely dynamic regeneration
+                    logger.debug(f"tier1 {url}: Last-Modified={val} accepted")
                     return {"date": val, "source": "Last-Modified header", "tier": 1}
-    except Exception:
-        pass
+            logger.debug(f"tier1 {url}: no usable Last-Modified header")
+    except Exception as e:
+        logger.debug(f"tier1 {url}: EXCEPTION {type(e).__name__}: {e}")
     return None
 
 
@@ -313,17 +352,22 @@ async def _tier2(session: aiohttp.ClientSession, url: str) -> dict | None:
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TO),
                                 allow_redirects=True, headers=HEADERS) as r:
+            logger.debug(f"tier2 {url}: GET -> status={r.status} content_type={r.content_type}")
             if r.content_type and "html" not in r.content_type and "text" not in r.content_type:
+                logger.debug(f"tier2 {url}: non-HTML response, skipping")
                 return None
             html = await r.text(errors="replace")
+            logger.debug(f"tier2 {url}: fetched {len(html)} bytes of HTML")
 
         # Try main page first
         date, src, cadence = _extract_from_html(html, url)
         if date:
+            logger.debug(f"tier2 {url}: extracted date={date} via {src!r}")
             return {"date": date, "source": src, "tier": 2, "cadence": cadence, "_html": html}
 
         # Main page found nothing — follow promising sub-links in parallel
         sublinks = _promising_sublinks(html, url)
+        logger.debug(f"tier2 {url}: main page had no date, following {len(sublinks)} sub-link(s): {sublinks}")
         if sublinks:
             async def _fetch_sub(sub_url: str) -> tuple[str | None, str, str | None]:
                 try:
@@ -336,7 +380,8 @@ async def _tier2(session: aiohttp.ClientSession, url: str) -> dict | None:
                             return None, "", None
                         sub_html = await sr.text(errors="replace")
                     return _extract_from_html(sub_html, sub_url)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"tier2 sub-link {sub_url}: EXCEPTION {type(e).__name__}: {e}")
                     return None, "", None
 
             sub_results = await asyncio.gather(*[_fetch_sub(s) for s in sublinks])
@@ -344,11 +389,13 @@ async def _tier2(session: aiohttp.ClientSession, url: str) -> dict | None:
             candidates = [(d, f"{s} (sub:{sub})", cad) for (d, s, cad), sub in zip(sub_results, sublinks) if d]
             if candidates:
                 best_date, best_src, best_cadence = max(candidates, key=lambda x: x[0])
+                logger.debug(f"tier2 {url}: best sub-link date={best_date} via {best_src!r}")
                 return {"date": best_date, "source": best_src, "tier": 2, "cadence": best_cadence, "_html": html}
 
+        logger.debug(f"tier2 {url}: no date found on main page or sub-links")
         return {"date": None, "source": "", "tier": 2, "cadence": None, "_html": html}  # pass html to tier3
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"tier2 {url}: EXCEPTION {type(e).__name__}: {e}")
     return None
 
 
@@ -361,7 +408,7 @@ def _tier3_sync(page_text: str, url: str) -> dict | None:
     try:
         prompt = (
             f"URL: {url}\n"
-            f"Page text (first 3000 chars):\n{page_text[:3000]}\n\n"
+            f"Page text (visible text only, up to 20000 chars):\n{page_text[:20000]}\n\n"
             "What is the LAST REFRESH / LAST UPDATED date for the DATASET or DATA on this page?\n\n"
             "This page likely contains several dates that are NOT the answer. Do NOT return:\n"
             "  - a copyright or footer year (e.g. \"© 2026\")\n"
@@ -375,25 +422,31 @@ def _tier3_sync(page_text: str, url: str) -> dict | None:
             "Return ONLY valid JSON, no markdown, no explanation: "
             '{"date": "YYYY-MM-DD or null", "source": "exact quoted phrase from the page text you used"}'
         )
+        logger.info(f"tier3 {url}: invoking Groq openai/gpt-oss-120b (page_text_len={len(page_text)})")
+        logger.debug(f"tier3 {url}: prompt sent:\n{prompt}")
         resp = _groq_client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
         raw = resp.choices[0].message.content.strip()
+        logger.debug(f"tier3 {url}: raw response:\n{raw}")
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         data = json.loads(raw)
         val = _parse_date(str(data.get("date") or ""))
         if val:
+            logger.info(f"tier3 {url}: parsed date={val} source={data.get('source')!r}")
             return {"date": val, "source": data.get("source", "groq-text"), "tier": 3}
-    except Exception:
-        pass
+        logger.info(f"tier3 {url}: model returned no usable date (raw date field: {data.get('date')!r})")
+    except Exception as e:
+        logger.debug(f"tier3 {url}: EXCEPTION {type(e).__name__}: {e}")
     return None
 
 
 async def _tier4(url: str) -> dict | None:
     try:
         from playwright.async_api import async_playwright
+        logger.debug(f"tier4 {url}: launching headless Chromium")
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
@@ -401,14 +454,17 @@ async def _tier4(url: str) -> dict | None:
             await page.wait_for_timeout(2000)
             html = await page.content()
             await browser.close()
+        logger.debug(f"tier4 {url}: rendered {len(html)} bytes of HTML")
 
         date, src, cadence = _extract_from_html(html, url)
         if date:
+            logger.debug(f"tier4 {url}: extracted date={date} via {src!r} (no LLM needed)")
             return {"date": date, "source": src + " (playwright)", "tier": 4, "cadence": cadence}
 
         # Playwright page text → Groq text-reasoning fallback
+        logger.debug(f"tier4 {url}: no date in rendered HTML, falling back to Groq text reasoning")
         soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(" ", strip=True)
+        text = _visible_text(soup)  # strips <script>/<style>/<noscript> before the LLM sees it
         async with _groq_text_sem:
             result = await asyncio.get_event_loop().run_in_executor(
                 None, _tier3_sync, text, url)
@@ -416,14 +472,16 @@ async def _tier4(url: str) -> dict | None:
             result["tier"] = 4
             result["source"] += " (playwright+groq)"
             return result
-    except Exception:
-        pass
+        logger.debug(f"tier4 {url}: Groq fallback also found nothing")
+    except Exception as e:
+        logger.debug(f"tier4 {url}: EXCEPTION {type(e).__name__}: {e}")
     return None
 
 
 def _tier5_sync(url: str) -> dict | None:
     """Groq compound-beta: real browser visit — handles bot walls and JS-heavy sites."""
     try:
+        logger.info(f"tier5 {url}: invoking Groq compound-beta (real-browsing agent)")
         resp = _groq_client.chat.completions.create(
             model="compound-beta",
             messages=[{"role": "user", "content": (
@@ -437,13 +495,16 @@ def _tier5_sync(url: str) -> dict | None:
             )}],
         )
         raw = resp.choices[0].message.content.strip()
+        logger.debug(f"tier5 {url}: raw response:\n{raw}")
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         data = json.loads(raw)
         val = _parse_date(str(data.get("date") or ""))
         if val:
+            logger.info(f"tier5 {url}: parsed date={val} source={data.get('source')!r}")
             return {"date": val, "source": data.get("source", "groq"), "tier": 5}
-    except Exception:
-        pass
+        logger.info(f"tier5 {url}: model returned no usable date (raw date field: {data.get('date')!r})")
+    except Exception as e:
+        logger.debug(f"tier5 {url}: EXCEPTION {type(e).__name__}: {e}")
     return None
 
 
@@ -456,6 +517,7 @@ _groq_text_sem: asyncio.Semaphore | None = None   # initialised in main() — Ti
 async def process_url(session: aiohttp.ClientSession, url: str,
                        global_sem: asyncio.Semaphore, tier_max: int) -> dict:
     if classify_url(url) == "catalog":
+        logger.info(f"process_url {url}: skipped — classified as catalog/browse page")
         return {
             "url": url, "date": None, "source": None, "tier": None,
             "error": "catalog/browse URL — no single dataset date exists, needs a corrected provenance URL",
@@ -463,6 +525,7 @@ async def process_url(session: aiohttp.ClientSession, url: str,
         }
 
     if classify_blocker(url) == "not_trackable":
+        logger.info(f"process_url {url}: skipped — not externally trackable")
         return {
             "url": url, "date": None, "source": None, "tier": None,
             "error": "no external source — not programmatically trackable",
@@ -480,6 +543,13 @@ async def process_url(session: aiohttp.ClientSession, url: str,
             result["extraction_time_sec"] = round(_time.time() - t0, 2)
             if not result["date"] and tried:
                 result["error"] = f"no date after tiers {result['tiers_attempted']}"
+            if result["date"]:
+                logger.info(f"process_url {url}: RESOLVED tier={result['tier']} date={result['date']} "
+                            f"source={result['source']!r} tiers_attempted={result['tiers_attempted']} "
+                            f"time={result['extraction_time_sec']}s")
+            else:
+                logger.info(f"process_url {url}: NO DATE FOUND tiers_attempted={result['tiers_attempted']} "
+                            f"time={result['extraction_time_sec']}s")
             return result
 
         # Tier 0: domain-specific handlers (P0/P1 fixes, see specialized_source_handlers.py).
@@ -488,17 +558,22 @@ async def process_url(session: aiohttp.ClientSession, url: str,
         for pattern, handler in SPECIALIZED_HANDLERS:
             if not pattern.search(url):
                 continue
+            logger.debug(f"tier0 {url}: matched handler {handler.__name__}")
             tried.append(0)
             r0 = await handler(url, session)
             if r0 and r0.get("_redirect_url"):
+                logger.debug(f"tier0 {url}: {handler.__name__} redirected to {r0['_redirect_url']}")
                 r1_redirect = await _tier1(session, r0["_redirect_url"])
                 if r1_redirect:
                     r1_redirect["source"] = f"{r1_redirect.get('source', 'Last-Modified header')} (via {r0['_redirect_url']})"
                     result.update(r1_redirect)
                     return _done()
             elif r0 and r0.get("date"):
+                logger.debug(f"tier0 {url}: {handler.__name__} found date={r0.get('date')}")
                 result.update(r0)
                 return _done()
+            else:
+                logger.debug(f"tier0 {url}: {handler.__name__} matched but found nothing, falling through to tiers 1-5")
             break
 
         # Run T1 + T2 together. Priority:
@@ -526,9 +601,10 @@ async def process_url(session: aiohttp.ClientSession, url: str,
         if html_cache:
             tried.append(3)
             soup = BeautifulSoup(html_cache, "html.parser")
+            text = _visible_text(soup)  # strips <script>/<style>/<noscript> before the LLM sees it
             async with _groq_text_sem:
                 r3 = await asyncio.get_event_loop().run_in_executor(
-                    None, _tier3_sync, soup.get_text(" ", strip=True), url)
+                    None, _tier3_sync, text, url)
             if r3: result.update(r3); return _done()
         if tier_max < 4: return _done()
 
@@ -548,6 +624,7 @@ async def process_url(session: aiohttp.ClientSession, url: str,
         # tier found — only reached when tiers 1-5 all found nothing.
         r0_census = await handle_census_url_vintage(url, session)
         if r0_census and r0_census.get("date"):
+            logger.debug(f"tier0-last-resort {url}: Census vintage-year fallback found {r0_census.get('date')}")
             tried.append(0)
             result.update(r0_census)
         return _done()
@@ -576,6 +653,10 @@ def load_urls(csv_path: str) -> dict[str, list[str]]:
 
 
 async def main(tier_max: int, resume: bool, input_csv: str = None, output_json: str = None):
+    log_path = setup_logging()
+    print(f"Detailed run log -> {log_path}")
+    logger.info(f"=== run started === csv={input_csv or INPUT_CSV} output={output_json or OUTPUT_JSON} tier_max={tier_max} resume={resume}")
+
     global _groq_sem, _groq_text_sem
     _groq_sem = asyncio.Semaphore(GROQ_CONCURRENCY)
     _groq_text_sem = asyncio.Semaphore(GROQ_TEXT_CONCURRENCY)
@@ -655,6 +736,8 @@ async def main(tier_max: int, resume: bool, input_csv: str = None, output_json: 
     for t in sorted(k for k in by_tier if k is not None):
         print(f"  Tier {t}    : {by_tier[t]}")
     print(f"  No date  : {by_tier[None]}")
+
+    logger.info(f"=== run finished === found={found}/{len(output)} by_tier={dict(by_tier)} output={out_path}")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ handler's own lookup failed" — the caller falls through to the normal
 tier 1-5 cascade rather than giving up.
 """
 
+import logging
 import os
 import re
 import json
@@ -23,6 +24,11 @@ import aiohttp
 from bs4 import BeautifulSoup
 from dateutil import parser as _dateparser
 from dateutil.parser import ParserError as _ParserError
+
+# Shares the same logger/handlers as provenance_refresh_extractor.py's
+# "refresh_pipeline" logger (configured there via setup_logging()) — using
+# a child name means these messages land in the same per-run log file.
+logger = logging.getLogger("refresh_pipeline.handlers")
 
 REQUEST_TO = 10
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StalenesBot/1.0)"}
@@ -128,21 +134,26 @@ async def handle_nasa_nccs(url: str, session: aiohttp.ClientSession) -> dict | N
     # climate-projection horizon), not a refresh signal — use .umm_json's
     # meta.revision-date, the actual metadata-record last-updated timestamp.
     api_url = f"https://cmr.earthdata.nasa.gov/search/collections.umm_json?short_name={short_name}"
+    logger.debug(f"nasa_nccs {url}: calling {api_url}")
     try:
         async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=REQUEST_TO),
                                 headers=HEADERS) as r:
+            logger.debug(f"nasa_nccs {url}: status={r.status}")
             if r.status != 200:
                 return None
             data = await r.json(content_type=None)
-    except Exception:
+    except Exception as e:
+        logger.debug(f"nasa_nccs {url}: EXCEPTION {type(e).__name__}: {e}")
         return None
 
     items = data.get("items") or []
     if not items:
+        logger.debug(f"nasa_nccs {url}: no items in CMR response")
         return None
     meta = items[0].get("meta") or {}
     val = _parse_date(meta.get("revision-date"))
     if val:
+        logger.debug(f"nasa_nccs {url}: found revision-date={val}")
         return {"date": val, "source": "nasa-cmr:revision-date", "tier": 0, "cadence": None}
     return None
 
@@ -158,20 +169,25 @@ async def handle_humdata(url: str, session: aiohttp.ClientSession) -> dict | Non
         return None
     slug = m.group(1)
     api_url = f"https://data.humdata.org/api/3/action/package_show?id={slug}"
+    logger.debug(f"humdata {url}: calling {api_url}")
     try:
         async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=REQUEST_TO),
                                 headers=HEADERS) as r:
+            logger.debug(f"humdata {url}: status={r.status}")
             if r.status != 200:
                 return None
             data = await r.json(content_type=None)
-    except Exception:
+    except Exception as e:
+        logger.debug(f"humdata {url}: EXCEPTION {type(e).__name__}: {e}")
         return None
 
     if not data.get("success"):
+        logger.debug(f"humdata {url}: CKAN response success=false")
         return None
     result = data.get("result") or {}
     val = _parse_date(result.get("metadata_modified"))
     if val:
+        logger.debug(f"humdata {url}: found metadata_modified={val}")
         return {"date": val, "source": "humdata-ckan:metadata_modified", "tier": 0, "cadence": None}
     return None
 
@@ -187,13 +203,16 @@ async def handle_ndap(url: str, session: aiohttp.ClientSession) -> dict | None:
         return None
     dataset_id = m.group(1)
     api_url = f"https://ndap.niti.gov.in/api/1/util/snippet/?id={dataset_id}"
+    logger.debug(f"ndap {url}: calling {api_url}")
     try:
         async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=REQUEST_TO),
                                 headers=HEADERS) as r:
+            logger.debug(f"ndap {url}: status={r.status}")
             if r.status != 200:
                 return None
             data = await r.json(content_type=None)
-    except Exception:
+    except Exception as e:
+        logger.debug(f"ndap {url}: EXCEPTION {type(e).__name__}: {e}")
         return None
 
     # Response shape is undocumented — search common key names defensively,
@@ -203,7 +222,9 @@ async def handle_ndap(url: str, session: aiohttp.ClientSession) -> dict | None:
         for key in ("last_updated", "lastUpdated", "updated_at", "updatedAt"):
             val = _parse_date(c.get(key))
             if val:
+                logger.debug(f"ndap {url}: found {key}={val}")
                 return {"date": val, "source": f"ndap-api:{key}", "tier": 0, "cadence": None}
+    logger.debug(f"ndap {url}: no recognized date key in response")
     return None
 
 
@@ -225,22 +246,29 @@ async def handle_github_tree(url: str, session: aiohttp.ClientSession) -> dict |
     headers = dict(HEADERS)
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    else:
+        logger.debug(f"github_tree {url}: no GITHUB_TOKEN set, calling unauthenticated (60 req/hr limit)")
+    logger.debug(f"github_tree {url}: calling {api_url} path={path}")
     try:
         async with session.get(api_url, params={"path": path, "per_page": 1},
                                 timeout=aiohttp.ClientTimeout(total=REQUEST_TO),
                                 headers=headers) as r:
+            logger.debug(f"github_tree {url}: status={r.status}")
             if r.status != 200:
                 return None
             data = await r.json(content_type=None)
-    except Exception:
+    except Exception as e:
+        logger.debug(f"github_tree {url}: EXCEPTION {type(e).__name__}: {e}")
         return None
 
     if not data:
+        logger.debug(f"github_tree {url}: no commits returned for path={path}")
         return None
     commit = (data[0] or {}).get("commit") or {}
     for who in ("committer", "author"):
         val = _parse_date((commit.get(who) or {}).get("date"))
         if val:
+            logger.debug(f"github_tree {url}: found {who} date={val}")
             return {"date": val, "source": f"github-commits-api:{who}", "tier": 0, "cadence": None}
     return None
 
@@ -256,18 +284,22 @@ async def handle_epa_ftp(url: str, session: aiohttp.ClientSession) -> dict | Non
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TO),
                                 headers=HEADERS) as r:
+            logger.debug(f"epa_ftp {url}: status={r.status}")
             if r.status != 200:
                 return None
             html = await r.text(errors="replace")
-    except Exception:
+    except Exception as e:
+        logger.debug(f"epa_ftp {url}: EXCEPTION {type(e).__name__}: {e}")
         return None
 
     timestamps = _FTP_TIMESTAMP_RE.findall(html)
     if not timestamps:
+        logger.debug(f"epa_ftp {url}: no timestamps found in directory listing")
         return None
     best = max(t for t in timestamps if _parse_date(t))
     val = _parse_date(best)
     if val:
+        logger.debug(f"epa_ftp {url}: found latest directory timestamp={val}")
         return {"date": val, "source": "epa-ftp:directory-listing", "tier": 0, "cadence": None}
     return None
 
