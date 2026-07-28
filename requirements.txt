@@ -1,0 +1,7 @@
+aiohttp
+beautifulsoup4
+python-dateutil
+python-dotenv
+groq
+playwright
+openpyxl
