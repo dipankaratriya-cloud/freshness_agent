@@ -43,8 +43,14 @@ def _parse_date(val: str | None) -> str | None:
     val = str(val).strip()
     if val.upper() in ("NONE", "N/A", "NA", ""):
         return None
+    if re.fullmatch(r'\d{4}', val):
+        return None
     try:
-        parsed = _dateparser.parse(val, fuzzy=True)
+        # See provenance_refresh_extractor._parse_date for why an explicit
+        # distant default is required — without it, a date string missing a
+        # day/month (e.g. "July 2024") silently gets today's day filled in.
+        from datetime import datetime as _datetime
+        parsed = _dateparser.parse(val, fuzzy=True, default=_datetime(1900, 1, 1))
     except (_ParserError, ValueError, OverflowError):
         return None
     if not parsed:

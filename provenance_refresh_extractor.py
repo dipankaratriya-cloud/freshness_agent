@@ -162,6 +162,22 @@ def _detect_daily_cadence(url: str, body_text: str) -> bool:
     return bool(_DAILY_CADENCE_PHRASE_RE.search(body_text[:1000]))
 
 
+def _url_is_daily_cadence_allowlisted(url: str) -> bool:
+    return any(p in url.lower() for p in _DAILY_CADENCE_URL_ALLOWLIST)
+
+
+def _fails_llm_recency_guard(val: str, url: str) -> bool:
+    """True if an LLM-returned date should be rejected as a likely dynamic
+    "as of today" pointer rather than a real refresh event — the same
+    recency threshold _extract_from_html applies to regex-scanned body
+    text, but that guard only covers Tiers 2/4's own extraction; the LLM
+    tiers (3/4-fallback/5) had no equivalent check, so a page with a live
+    "current as of" marker could make the model confidently return today's
+    date as if it were a real answer."""
+    days_old = (_date.today() - _date.fromisoformat(val)).days
+    return days_old < _BODY_DATE_RECENCY_DAYS and not _url_is_daily_cadence_allowlisted(url)
+
+
 def _parse_date(val: str | None) -> str | None:
     if not val:
         return None
@@ -171,7 +187,14 @@ def _parse_date(val: str | None) -> str | None:
     if re.fullmatch(r'\d{4}', val):
         return None
     try:
-        dt = _dateparser.parse(val, fuzzy=True)
+        # Without an explicit `default`, dateutil fills any date component
+        # missing from the string (e.g. "July 2024" has no day) using
+        # datetime.now() — silently manufacturing a false-precision date
+        # that carries TODAY's day, not a real one. Anchoring to a distant
+        # placeholder instead makes a missing-year string get rejected by
+        # the year-range check below, and a missing-day string resolve to
+        # day 1 of the month rather than an arbitrary "today" day.
+        dt = _dateparser.parse(val, fuzzy=True, default=datetime(1900, 1, 1))
     except (_ParserError, OverflowError, ValueError):
         return None
     if not dt or not (2000 <= dt.year <= _date.today().year + 1):
@@ -434,6 +457,10 @@ def _tier3_sync(page_text: str, url: str) -> dict | None:
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         data = json.loads(raw)
         val = _parse_date(str(data.get("date") or ""))
+        if val and _fails_llm_recency_guard(val, url):
+            logger.info(f"tier3 {url}: rejecting date={val} — within {_BODY_DATE_RECENCY_DAYS}d of today "
+                        f"and not on the daily-cadence allowlist, likely a dynamic 'as of today' pointer")
+            val = None
         if val:
             logger.info(f"tier3 {url}: parsed date={val} source={data.get('source')!r}")
             return {"date": val, "source": data.get("source", "groq-text"), "tier": 3}
@@ -499,6 +526,10 @@ def _tier5_sync(url: str) -> dict | None:
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         data = json.loads(raw)
         val = _parse_date(str(data.get("date") or ""))
+        if val and _fails_llm_recency_guard(val, url):
+            logger.info(f"tier5 {url}: rejecting date={val} — within {_BODY_DATE_RECENCY_DAYS}d of today "
+                        f"and not on the daily-cadence allowlist, likely a dynamic 'as of today' pointer")
+            val = None
         if val:
             logger.info(f"tier5 {url}: parsed date={val} source={data.get('source')!r}")
             return {"date": val, "source": data.get("source", "groq"), "tier": 5}
