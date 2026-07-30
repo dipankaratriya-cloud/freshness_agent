@@ -150,6 +150,29 @@ def _noop_log(_msg: str) -> None:
     pass
 
 
+async def _screenshot_with_retry(page, log_fn=_noop_log, retries: int = 2, delay: float = 1.5):
+    """page.screenshot() intermittently fails on transient rendering hiccups
+    (e.g. a font-load timeout inside Chromium's screenshot protocol) — this
+    killed whole Tier 6 attempts mid-exploration with budget still remaining
+    (confirmed live: a metadata-modal case died here with 12 steps left).
+    Retries a couple of times before giving up. Returns None — not raising —
+    when the page/browser is genuinely gone (TargetClosedError), since no
+    amount of retrying fixes that; the caller decides how to end gracefully."""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return await page.screenshot(type="png")
+        except Exception as e:
+            last_exc = e
+            if "closed" in str(e).lower() or "TargetClosedError" in type(e).__name__:
+                log_fn(f"Screenshot failed, page/browser is closed — not retrying: {type(e).__name__}: {e}")
+                return None
+            log_fn(f"Screenshot attempt {attempt + 1}/{retries + 1} failed ({type(e).__name__}: {e}), retrying in {delay}s...")
+            await asyncio.sleep(delay)
+    log_fn(f"Screenshot failed after {retries + 1} attempts: {type(last_exc).__name__}: {last_exc}")
+    return None
+
+
 async def tier6_computer_use(url: str, sem: asyncio.Semaphore, log_fn=_noop_log) -> dict:
     """Drives a real browser with Gemini's computer-use tool.
     Returns {"date", "source", "tier", "steps_used", "error", "action_trace"} —
@@ -171,7 +194,12 @@ async def tier6_computer_use(url: str, sem: asyncio.Semaphore, log_fn=_noop_log)
             except Exception as e:
                 log_fn(f"Initial navigation failed ({type(e).__name__}: {e}) — letting the model see whatever loaded")
 
-            shot = await page.screenshot(type="png")
+            shot = await _screenshot_with_retry(page, log_fn)
+            if shot is None:
+                await browser.close()
+                return {"date": None, "source": None, "tier": 6, "steps_used": 0,
+                        "error": "browser/page closed unexpectedly before the first screenshot",
+                        "action_trace": []}
             prompt_text = TASK_PROMPT_TEMPLATE.format(url=url, max_steps=MAX_STEPS)
             log_fn(f"Prompt sent:\n{prompt_text}")
             contents = [types.Content(role="user", parts=[
@@ -227,7 +255,13 @@ async def tier6_computer_use(url: str, sem: asyncio.Semaphore, log_fn=_noop_log)
                         "step": step + 1, "action": fc.name, "args": fc_args,
                         "intent": intent, "error": err,
                     })
-                    shot = await page.screenshot(type="png")
+                    new_shot = await _screenshot_with_retry(page, log_fn)
+                    if new_shot is None:
+                        log_fn(f"[step {step + 1}] Could not capture a screenshot after this action "
+                               f"(page/browser closed) — ending attempt with progress so far")
+                        result["error"] = f"page/browser closed unexpectedly at step {step + 1}"
+                        break
+                    shot = new_shot
                     response_payload = {"error": err} if err else {"url": page.url}
                     if safety.get("decision") == "require_confirmation":
                         # No human is in the loop in this unattended batch pipeline; every
