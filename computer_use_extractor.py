@@ -35,7 +35,8 @@ from computer_use_prompt import TASK_PROMPT_TEMPLATE
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 MODEL        = "gemini-3.6-flash"
-MAX_STEPS    = 12          # actions per URL before giving up
+MAX_STEPS    = 40          # actions per URL before giving up — generous now that cost isn't the constraint;
+                           # still bounded so one pathological URL can't stall the whole batch run indefinitely
 CONCURRENCY  = 3           # real browsers + a slow multimodal model — keep this low
 VIEWPORT     = {"width": 1440, "height": 900}
 

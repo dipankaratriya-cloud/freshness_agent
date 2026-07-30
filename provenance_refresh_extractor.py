@@ -100,7 +100,12 @@ _DATE_RE = re.compile(
     r'last\s+(?:updated?|modified|refreshed?|revised?)|'
     r'data\s+(?:as\s+of|updated?|through)|'
     r'updated?|as\s+of|'
-    r'released?(?:\s+on)?|published?(?:\s+on)?'
+    # Bare "released"/"published" (no "data"/"dataset" qualifier) is too weak a
+    # trigger — it matches unrelated news/article-publication blurbs (e.g. "our
+    # paper is published at Joule") just as readily as a real refresh notice.
+    # Requiring the qualifier keeps legitimate "Data released: <date>" /
+    # "Dataset published <date>" phrasing while dropping that decoy pattern.
+    r'data(?:set)?\s+released?(?:\s+on)?|data(?:set)?\s+published?(?:\s+on)?'
     # "effective date" deliberately excluded — means when a regulation/policy
     # takes effect, not when the underlying dataset was refreshed
     r')[:\s]+([A-Za-z0-9,\s/-]{4,30})',
@@ -210,7 +215,7 @@ def _first_year(text: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _visible_text(soup: BeautifulSoup, max_chars: int = 20000) -> str:
+def _visible_text(soup: BeautifulSoup, max_chars: int = 500000) -> str:
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     return soup.get_text(" ", strip=True)[:max_chars]

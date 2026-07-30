@@ -29,6 +29,7 @@ import asyncio
 import csv
 import json
 import os
+import random
 import re
 import time
 from collections import defaultdict
@@ -49,6 +50,7 @@ from specialized_source_handlers import (    # noqa: E402
 )
 
 from tier3_prompt import TIER3_PROMPT_TEMPLATE
+from validation_prompt import VALIDATION_PROMPT_TEMPLATE
 from computer_use_extractor import tier6_computer_use
 import verification_recipes as vr
 import bq_io
@@ -69,6 +71,7 @@ _client = genai.Client(api_key=_api_key)
 
 _TIER3_CONFIG = types.GenerateContentConfig(
     thinking_config=types.ThinkingConfig(include_thoughts=True),
+    temperature=0,   # factual extraction, not navigation — match the old Groq Tier 3's determinism
 )
 
 
@@ -107,7 +110,7 @@ def _tier3_gemini_sync(page_text: str, url: str, log_fn=_noop_log) -> dict | Non
     openai/gpt-oss-120b Tier 3 played: read text we ALREADY fetched (never
     browses itself) and pick the real refresh date out of decoys."""
     try:
-        prompt = TIER3_PROMPT_TEMPLATE.format(url=url, page_text=page_text[:20000])
+        prompt = TIER3_PROMPT_TEMPLATE.format(url=url, page_text=page_text[:500000])
         log_fn(f"=== TIER 3: Gemini 3.1 Pro text reasoning ===\nPrompt sent:\n{prompt}")
         response = _client.models.generate_content(
             model=TIER3_MODEL, contents=prompt, config=_TIER3_CONFIG)
@@ -133,6 +136,36 @@ def _tier3_gemini_sync(page_text: str, url: str, log_fn=_noop_log) -> dict | Non
     return None
 
 
+def _validate_candidate_sync(url: str, candidate_date: str, page_text: str, log_fn=_noop_log) -> bool:
+    """Second-opinion Gemini check for dates found by the cheap body-text
+    regex — the only extraction path with no real judgment, so it can be
+    fooled by a decoy date sitting near a trigger word (e.g. an unrelated
+    news/paper-publication announcement — see PIPELINE_CHANGELOG for the
+    web.stanford.edu/deepsolar case that motivated this). Any parse failure
+    or exception defaults to False (reject) rather than silently trusting an
+    unverified regex hit."""
+    try:
+        prompt = VALIDATION_PROMPT_TEMPLATE.format(
+            url=url, candidate_date=candidate_date, page_text=page_text[:500000])
+        log_fn(f"=== VALIDATION: Gemini 3.1 Pro confidence check on body-text candidate {candidate_date} ===\nPrompt sent:\n{prompt}")
+        response = _client.models.generate_content(
+            model=TIER3_MODEL, contents=prompt, config=_TIER3_CONFIG)
+        parts = response.candidates[0].content.parts
+        thought_text = "".join(p.text or "" for p in parts if getattr(p, "thought", False))
+        final_text = "".join(p.text or "" for p in parts if not getattr(p, "thought", False))
+        if thought_text:
+            log_fn(f"THOUGHT: {thought_text}")
+        log_fn(f"Raw response: {final_text}")
+        cleaned = re.sub(r"^```(?:json)?|```$", "", final_text.strip(), flags=re.MULTILINE).strip()
+        data = json.loads(cleaned)
+        confident = bool(data.get("confident"))
+        log_fn(f"VALIDATION RESULT: confident={confident} reason={data.get('reason')!r}")
+        return confident
+    except Exception as e:
+        log_fn(f"VALIDATION EXCEPTION {type(e).__name__}: {e} — treating as not confident")
+        return False
+
+
 async def _tier4(url: str, log_fn=_noop_log) -> dict | None:
     try:
         from playwright.async_api import async_playwright
@@ -145,14 +178,23 @@ async def _tier4(url: str, log_fn=_noop_log) -> dict | None:
             html = await page.content()
             await browser.close()
 
-        date, src, cadence = _extract_from_html(html, url)
-        if date:
-            log_fn(f"RESULT: date={date} via {src!r} (no LLM needed)")
-            return {"date": date, "source": src + " (playwright)", "tier": 4, "cadence": cadence}
-
-        log_fn("No date in rendered HTML, falling back to Gemini 3.1 Pro text reasoning")
         soup = BeautifulSoup(html, "html.parser")
         text = _visible_text(soup)
+
+        date, src, cadence = _extract_from_html(html, url)
+        if date:
+            confirmed = True
+            if src == "body-text":   # the only extraction path prone to decoy false positives
+                confirmed = await asyncio.get_event_loop().run_in_executor(
+                    None, _validate_candidate_sync, url, date, text, log_fn)
+            if confirmed:
+                note = "validated, no full LLM extraction needed" if src == "body-text" else "no LLM needed"
+                log_fn(f"RESULT: date={date} via {src!r} ({note})")
+                return {"date": date, "source": src + " (playwright)", "tier": 4, "cadence": cadence,
+                        "validated": src == "body-text"}
+            log_fn(f"Candidate date={date} via {src!r} rejected by validation — falling back to full extraction")
+
+        log_fn("No confident date in rendered HTML, falling back to Gemini 3.1 Pro text reasoning")
         result = await asyncio.get_event_loop().run_in_executor(
             None, _tier3_gemini_sync, text, url, log_fn)
         if result:
@@ -231,14 +273,28 @@ async def process_url(session: aiohttp.ClientSession, url: str, dataset_ids: lis
         r1, r2 = await asyncio.gather(_tier1(session, url), _tier2(session, url))
         html_cache = None
         t2_got_html = False
+        # Computed once here (instead of re-parsing later) so it's ready for
+        # both Tier 2's validation check below and Tier 3's text-reasoning call.
+        soup = None
+        text = ""
         if r2:
             html_cache = r2.pop("_html", None)
             t2_got_html = html_cache is not None
+            if html_cache:
+                soup = BeautifulSoup(html_cache, "html.parser")
+                text = _visible_text(soup)
             if r2["date"]:
-                log_fn(f"Tier 2 found date={r2['date']} via {r2['source']!r}")
-                result.update(r2)
-                result["verification_steps"] = vr.recipe_tier2(url, r2["source"], r2["date"])
-                return _finish()
+                confirmed = True
+                if r2["source"] == "body-text":   # the only extraction path prone to decoy false positives
+                    confirmed = await asyncio.get_event_loop().run_in_executor(
+                        None, _validate_candidate_sync, url, r2["date"], text, log_fn)
+                    if not confirmed:
+                        log_fn(f"Tier 2 candidate date={r2['date']} rejected by validation — continuing to later tiers")
+                if confirmed:
+                    log_fn(f"Tier 2 found date={r2['date']} via {r2['source']!r}")
+                    result.update(r2)
+                    result["verification_steps"] = vr.recipe_tier2(url, r2["source"], r2["date"])
+                    return _finish()
         if r1 and not t2_got_html:
             log_fn(f"Tier 2 could not fetch HTML; using Tier 1 Last-Modified={r1['date']}")
             result.update(r1)
@@ -246,11 +302,12 @@ async def process_url(session: aiohttp.ClientSession, url: str, dataset_ids: lis
             return _finish()
         log_fn("Tiers 1/2 found nothing")
 
-        # Tier 3
-        if html_cache:
+        # Tier 3 — skip if there's no actual text to read (e.g. a JS-rendered
+        # page whose plain-HTTP-fetched HTML is just a script shell): an LLM
+        # call on an empty string can only ever return null, so it's a wasted
+        # round trip — go straight to Tier 4's Playwright render instead.
+        if text.strip():
             tried.append(3)
-            soup = BeautifulSoup(html_cache, "html.parser")
-            text = _visible_text(soup)
             async with gemini_sem:
                 r3 = await asyncio.get_event_loop().run_in_executor(
                     None, _tier3_gemini_sync, text, url, log_fn)
@@ -310,7 +367,7 @@ def load_urls(csv_path: str) -> dict[str, list[str]]:
 
 
 async def main(input_csv: str | None, output_csv: str, limit: int | None,
-               source: str, billing_project: str):
+               source: str, billing_project: str, random_sample: bool = False):
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     if source == "bq":
@@ -322,7 +379,7 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
         url_map = load_urls(input_csv)
     all_urls = list(url_map.keys())
     if limit:
-        all_urls = all_urls[:limit]
+        all_urls = random.sample(all_urls, min(limit, len(all_urls))) if random_sample else all_urls[:limit]
     print(f"Loaded {len(url_map)} unique URLs ({sum(len(v) for v in url_map.values())} dataset ids); running {len(all_urls)}")
 
     global_sem = asyncio.Semaphore(TIER012_CONCURRENCY)
@@ -386,5 +443,7 @@ if __name__ == "__main__":
     ap.add_argument("--billing-project", default=os.environ.get("GCP_PROJECT", "datcom-infosys-dev"),
                     help="GCP project used to run the BQ query job and to hold refresh_dates_v2")
     ap.add_argument("--limit",  type=int, default=None, help="cap number of URLs (for testing)")
+    ap.add_argument("--random", action="store_true",
+                    help="with --limit N, pick N random URLs instead of the first N (e.g. for a representative smoke test)")
     args = ap.parse_args()
-    asyncio.run(main(args.input, args.output, args.limit, args.source, args.billing_project))
+    asyncio.run(main(args.input, args.output, args.limit, args.source, args.billing_project, args.random))
