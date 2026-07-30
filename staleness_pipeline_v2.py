@@ -367,11 +367,13 @@ def load_urls(csv_path: str) -> dict[str, list[str]]:
 
 
 async def main(input_csv: str | None, output_csv: str, limit: int | None,
-               source: str, billing_project: str, random_sample: bool = False):
+               source: str, billing_project: str, random_sample: bool = False,
+               write_bq: bool = True):
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     if source == "bq":
-        bq_io.ensure_table(billing_project)
+        if write_bq:
+            bq_io.ensure_table(billing_project)   # only needed if we're about to write to it
         url_map = bq_io.load_urls_from_bq(billing_project)
     else:
         if not input_csv:
@@ -430,8 +432,10 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
     print(f"\nResults saved -> {output_csv}")
     print(f"Found date: {found}/{len(csv_rows)} ({found * 100 // max(len(csv_rows), 1)}%)")
 
-    if source == "bq":
+    if source == "bq" and write_bq:
         bq_io.write_results(billing_project, run_id, csv_rows)
+    elif source == "bq":
+        print("(--no-bq-write set — skipped writing to refresh_dates_v2, results are only in the local CSV)")
 
 
 if __name__ == "__main__":
@@ -445,5 +449,8 @@ if __name__ == "__main__":
     ap.add_argument("--limit",  type=int, default=None, help="cap number of URLs (for testing)")
     ap.add_argument("--random", action="store_true",
                     help="with --limit N, pick N random URLs instead of the first N (e.g. for a representative smoke test)")
+    ap.add_argument("--no-bq-write", action="store_true",
+                    help="with --source bq: still fetch input from BigQuery, but only write the local CSV — skip refresh_dates_v2 entirely")
     args = ap.parse_args()
-    asyncio.run(main(args.input, args.output, args.limit, args.source, args.billing_project, args.random))
+    asyncio.run(main(args.input, args.output, args.limit, args.source, args.billing_project,
+                      args.random, not args.no_bq_write))
