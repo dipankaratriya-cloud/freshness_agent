@@ -41,9 +41,11 @@ WHERE edge.predicate='sourceDataUrl'
 REFRESH_DATES_V2_SCHEMA = [
     bigquery.SchemaField("run_id",              "STRING"),
     bigquery.SchemaField("run_date",            "DATE"),
+    bigquery.SchemaField("serial_no",           "INT64"),
     bigquery.SchemaField("dataset_id",          "STRING"),
     bigquery.SchemaField("provenance_url",      "STRING"),
     bigquery.SchemaField("last_refresh_date",   "STRING"),
+    bigquery.SchemaField("date_method",         "STRING"),
     bigquery.SchemaField("date_source",         "STRING"),
     bigquery.SchemaField("tier_used",           "INT64"),
     bigquery.SchemaField("date_found",          "BOOL"),
@@ -118,9 +120,11 @@ def write_results(billing_project: str, run_id: str, rows: list[dict]) -> None:
         {
             "run_id":              run_id,
             "run_date":            today,
+            "serial_no":           r.get("serial_no"),
             "dataset_id":          r.get("object_id", ""),
             "provenance_url":      r.get("url", ""),
             "last_refresh_date":   r.get("last_refresh_date"),
+            "date_method":         r.get("date_method"),
             "date_source":         r.get("date_source"),
             "tier_used":           r.get("tier_used"),
             "date_found":          bool(r.get("date_found")),

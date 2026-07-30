@@ -105,3 +105,36 @@ def recipe_no_date(tiers_attempted: str) -> str:
         f"No verification steps — tiers [{tiers_attempted}] were all attempted "
         f"and none found a usable date."
     )
+
+
+def method_label(tier_used, date_source: str) -> str:
+    """Short, human-scannable answer to "how was this found" — a CSV column
+    version of the same tier/source info recipe_* already turns into full
+    step-by-step prose."""
+    if tier_used is None or tier_used == "":
+        return "Not found"
+    tier_used = int(tier_used)
+    source = date_source or ""
+
+    if tier_used == 0:
+        return "Direct API / domain-specific handler"
+    if tier_used == 1:
+        return "HTTP Last-Modified header"
+    if tier_used == 3:
+        return "Gemini text reasoning (LLM)"
+    if tier_used in (2, 4):
+        if "(playwright+gemini)" in source:
+            return "Gemini text reasoning (LLM, rendered page)"
+        clean = source.replace(" (playwright)", "").split(" (sub:")[0]
+        if clean.startswith("json-ld:"):
+            base = "JSON-LD structured data"
+        elif clean.startswith("meta:"):
+            base = "HTML meta tag"
+        elif clean.startswith("body-text"):
+            base = "Regex pattern match (Gemini-validated)"
+        else:
+            base = "Structured field match"
+        return f"{base}, rendered page" if tier_used == 4 else base
+    if tier_used == 6:
+        return "Gemini computer-use (browser navigation)"
+    return f"Tier {tier_used}"

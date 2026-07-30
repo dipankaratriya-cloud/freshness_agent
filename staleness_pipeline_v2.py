@@ -83,13 +83,17 @@ def _safe_filename(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", s)[:150] or "unnamed"
 
 
-def _write_log(object_id: str, url: str, dataset_ids: list, log_lines: list, result: dict) -> str:
+def _write_log(serial: int, object_id: str, url: str, dataset_ids: list, log_lines: list, result: dict) -> str:
     """Writes the local .log file (useful for local runs) and returns the
     same full text so it can be attached to the BigQuery row's detailed_log
     column — Cloud Run's local filesystem disappears when the job exits, so
-    that column is the only durable copy of this detail in that environment."""
+    that column is the only durable copy of this detail in that environment.
+
+    The filename is prefixed with the same serial number written to the CSV's
+    serial_no column, so a row can be matched to its log file by eye without
+    comparing the (long, hashed) object_id strings."""
     full_text = (
-        f"URL: {url}\ndataset_ids: {dataset_ids}\n\n"
+        f"Serial: {serial}\nURL: {url}\ndataset_ids: {dataset_ids}\n\n"
         + "\n\n".join(log_lines)
         + f"\n\n=== RESULT ===\n"
         f"tier_used: {result.get('tier')}\n"
@@ -99,7 +103,7 @@ def _write_log(object_id: str, url: str, dataset_ids: list, log_lines: list, res
         f"verification_steps: {result.get('verification_steps')}\n"
     )
     os.makedirs(LOGS_DIR, exist_ok=True)
-    path = os.path.join(LOGS_DIR, _safe_filename(object_id) + ".log")
+    path = os.path.join(LOGS_DIR, f"{serial:04d}_{_safe_filename(object_id)}.log")
     with open(path, "w", encoding="utf-8") as f:
         f.write(full_text)
     return full_text
@@ -207,7 +211,7 @@ async def _tier4(url: str, log_fn=_noop_log) -> dict | None:
     return None
 
 
-async def process_url(session: aiohttp.ClientSession, url: str, dataset_ids: list,
+async def process_url(session: aiohttp.ClientSession, url: str, dataset_ids: list, serial: int,
                        global_sem: asyncio.Semaphore, gemini_sem: asyncio.Semaphore,
                        tier6_sem: asyncio.Semaphore) -> dict:
     log_lines = []
@@ -216,7 +220,7 @@ async def process_url(session: aiohttp.ClientSession, url: str, dataset_ids: lis
 
     t0 = time.time()
     tried = []
-    result = {"url": url, "date": None, "source": None, "tier": None,
+    result = {"url": url, "serial": serial, "date": None, "source": None, "tier": None,
               "error": None, "verification_steps": None}
 
     def _finish():
@@ -226,7 +230,7 @@ async def process_url(session: aiohttp.ClientSession, url: str, dataset_ids: lis
             result["error"] = f"no date after tiers {result['tiers_attempted']}"
         if not result["verification_steps"]:
             result["verification_steps"] = vr.recipe_no_date(result["tiers_attempted"] or "none")
-        result["detailed_log"] = _write_log(dataset_ids[0], url, dataset_ids, log_lines, result)
+        result["detailed_log"] = _write_log(serial, dataset_ids[0], url, dataset_ids, log_lines, result)
         return result
 
     if classify_url(url) == "catalog":
@@ -391,7 +395,8 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
 
     results = []
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [process_url(session, url, url_map[url], global_sem, gemini_sem, tier6_sem) for url in all_urls]
+        tasks = [process_url(session, url, url_map[url], serial, global_sem, gemini_sem, tier6_sem)
+                 for serial, url in enumerate(all_urls, start=1)]
         done = 0
         for coro in asyncio.as_completed(tasks):
             r = await coro
@@ -404,9 +409,11 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
     for r in results:
         for oid in url_map[r["url"]]:
             csv_rows.append({
+                "serial_no":           r["serial"],
                 "object_id":           oid,
                 "url":                 r["url"],
                 "last_refresh_date":   r["date"],
+                "date_method":         vr.method_label(r["tier"], r["source"]),
                 "date_source":         r["source"],
                 "tier_used":           r["tier"],
                 "date_found":          bool(r["date"]),
@@ -418,11 +425,12 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
             })
 
     # detailed_log is intentionally not a CSV column (would bloat the file;
-    # local logs/ already has it per-URL) — extrasaction="ignore" lets the
-    # same csv_rows list feed both the CSV and (in bq mode) bq_io.write_results.
-    fieldnames = ["object_id", "url", "last_refresh_date", "date_source", "tier_used",
-                  "date_found", "verification_steps", "tiers_attempted",
-                  "tier_failed_reason", "extraction_time_sec"]
+    # local logs/<serial>_<object_id>.log already has it, matched by serial_no)
+    # — extrasaction="ignore" lets the same csv_rows list feed both the CSV
+    # and (in bq mode) bq_io.write_results.
+    fieldnames = ["serial_no", "object_id", "url", "last_refresh_date", "date_method",
+                  "date_source", "tier_used", "date_found", "verification_steps",
+                  "tiers_attempted", "tier_failed_reason", "extraction_time_sec"]
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
