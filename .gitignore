@@ -1,5 +1,17 @@
+# Environment & secrets
 .env
+*.env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
-*.pyc
-.DS_Store
+*.py[cod]
+.venv/
+venv/
+
+# Generated output — not source
 logs/
+staleness_results.csv
+*.csv
+!provenance_bigquery.csv.example

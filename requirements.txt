@@ -1,7 +1,31 @@
+# Core pipeline
+python-dotenv
+requests
+playwright
 aiohttp
 beautifulsoup4
-python-dateutil
-python-dotenv
-groq
-playwright
 openpyxl
+pyarrow
+groq
+
+# GCP
+google-cloud-bigquery
+google-cloud-storage
+google-generativeai
+google-genai   # experiment2/ Gemini computer-use + Tier 3/6 (google.genai, distinct from google-generativeai above)
+
+# Existing deps
+# dataclasses  ← built into Python 3.7+, no install needed
+# datacommons  ← all PyPI versions yanked, not imported in pipeline
+earthengine-api
+geojson
+geopy
+google-cloud-logging
+lxml
+rasterio
+requests_cache
+retry
+s2sphere
+shapely
+urllib3
+pandas
