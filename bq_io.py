@@ -6,26 +6,29 @@ production pipeline; this one is its own Cloud Run Job with its own table).
 Input:  SOURCE_QUERY reads the live provenance graph (Edge/Node join filtered
         to predicate='sourceDataUrl') from datcom-store, owned by the data
         engineering team.
-Output: refresh_dates_v2 in this pipeline's own `staleness` BQ dataset
-        (project datcom-infosys-dev by default) — one row per dataset_id,
-        including the full per-URL log text inline (detailed_log column) so
-        there's no dependency on Cloud Run's ephemeral local filesystem.
+Output: data_freshness_report in datcom-import-dev-768877.dc_kg_dashboard — a
+        shared dashboard table (this pipeline is one of potentially several
+        writers into it). Append-only: one row per dataset per run. Full
+        per-URL logs live in GCS (see gcs_io.py); this table stores only the
+        gs:// URI pointing at each one, not the log text itself.
 
 NOTE: the billing project (whichever project runs the query job) needs
 `roles/bigquery.jobUser` there, AND the identity needs read access on
 datcom-store specifically — that grant must come from datcom-store's own
-project owner, not from anything here.
+project owner, not from anything here. Separately, datcom-import-dev-768877
+needs its own BigQuery write access, granted independently of datcom-store.
 """
 
 import os
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, timezone
 
 from google.cloud import bigquery
 
 from specialized_source_handlers import normalize_url
 
-BQ_DATASET = os.environ.get("BQ_DATASET", "staleness")
+BQ_DATASET = os.environ.get("BQ_DATASET", "dc_kg_dashboard")
+TABLE_NAME = "data_freshness_report"
 _client_cache: dict[str, bigquery.Client] = {}
 
 # Hard-coded per the data-engineering team's confirmation that this staging
@@ -38,11 +41,13 @@ ON edge.object_id=node.subject_id
 WHERE edge.predicate='sourceDataUrl'
 """
 
-REFRESH_DATES_V2_SCHEMA = [
+DATA_FRESHNESS_REPORT_SCHEMA = [
     bigquery.SchemaField("run_id",              "STRING"),
-    bigquery.SchemaField("run_date",            "DATE"),
+    bigquery.SchemaField("last_execution_date", "DATE"),
+    bigquery.SchemaField("created_at",          "TIMESTAMP"),
+    bigquery.SchemaField("updated_at",          "TIMESTAMP"),
     bigquery.SchemaField("serial_no",           "INT64"),
-    bigquery.SchemaField("dataset_id",          "STRING"),
+    bigquery.SchemaField("object_id",           "STRING"),
     bigquery.SchemaField("provenance_url",      "STRING"),
     bigquery.SchemaField("last_refresh_date",   "STRING"),
     bigquery.SchemaField("date_method",         "STRING"),
@@ -52,8 +57,8 @@ REFRESH_DATES_V2_SCHEMA = [
     bigquery.SchemaField("verification_steps",  "STRING"),
     bigquery.SchemaField("tiers_attempted",     "STRING"),
     bigquery.SchemaField("tier_failed_reason",  "STRING"),
-    bigquery.SchemaField("extraction_time_sec", "FLOAT64"),
-    bigquery.SchemaField("detailed_log",        "STRING"),
+    bigquery.SchemaField("time_to_execute_sec", "FLOAT64"),
+    bigquery.SchemaField("log_gcs_uri",         "STRING"),
 ]
 
 
@@ -64,7 +69,7 @@ def _client(billing_project: str) -> bigquery.Client:
 
 
 def _table(billing_project: str) -> str:
-    return f"{billing_project}.{BQ_DATASET}.refresh_dates_v2"
+    return f"{billing_project}.{BQ_DATASET}.{TABLE_NAME}"
 
 
 def load_urls_from_bq(billing_project: str) -> dict[str, list[str]]:
@@ -95,33 +100,36 @@ def ensure_table(billing_project: str) -> None:
     try:
         existing = client.get_table(table_ref)
         existing_fields = {f.name for f in existing.schema}
-        new_fields = [f for f in REFRESH_DATES_V2_SCHEMA if f.name not in existing_fields]
+        new_fields = [f for f in DATA_FRESHNESS_REPORT_SCHEMA if f.name not in existing_fields]
         if new_fields:
             existing.schema = list(existing.schema) + new_fields
             client.update_table(existing, ["schema"])
-            print(f"  [bq_io] schema updated: refresh_dates_v2 (+{len(new_fields)} new columns)")
+            print(f"  [bq_io] schema updated: {TABLE_NAME} (+{len(new_fields)} new columns)")
         else:
             print(f"  [bq_io] table ready: {table_ref}")
     except Exception:
-        t = bigquery.Table(table_ref, schema=REFRESH_DATES_V2_SCHEMA)
-        t.time_partitioning = bigquery.TimePartitioning(field="run_date")
-        t.clustering_fields = ["dataset_id"]
+        t = bigquery.Table(table_ref, schema=DATA_FRESHNESS_REPORT_SCHEMA)
+        t.time_partitioning = bigquery.TimePartitioning(field="last_execution_date")
+        t.clustering_fields = ["object_id"]
         client.create_table(t, exists_ok=True)
         print(f"  [bq_io] table created: {table_ref}")
 
 
 def write_results(billing_project: str, run_id: str, rows: list[dict]) -> None:
     """rows: the same per-dataset dicts staleness_pipeline_v2.main() builds
-    for the CSV, plus a 'detailed_log' key."""
+    for the CSV, plus a 'log_gcs_uri' key (see gcs_io.upload_log)."""
     if not rows:
         return
     today = str(date.today())
+    now = datetime.now(timezone.utc).isoformat()
     payload = [
         {
             "run_id":              run_id,
-            "run_date":            today,
+            "last_execution_date": today,
+            "created_at":          now,
+            "updated_at":          now,
             "serial_no":           r.get("serial_no"),
-            "dataset_id":          r.get("object_id", ""),
+            "object_id":           r.get("object_id", ""),
             "provenance_url":      r.get("url", ""),
             "last_refresh_date":   r.get("last_refresh_date"),
             "date_method":         r.get("date_method"),
@@ -131,8 +139,8 @@ def write_results(billing_project: str, run_id: str, rows: list[dict]) -> None:
             "verification_steps":  r.get("verification_steps"),
             "tiers_attempted":     r.get("tiers_attempted", ""),
             "tier_failed_reason":  r.get("tier_failed_reason"),
-            "extraction_time_sec": r.get("extraction_time_sec"),
-            "detailed_log":        r.get("detailed_log", ""),
+            "time_to_execute_sec": r.get("extraction_time_sec"),
+            "log_gcs_uri":         r.get("log_gcs_uri", ""),
         }
         for r in rows
     ]
@@ -140,4 +148,4 @@ def write_results(billing_project: str, run_id: str, rows: list[dict]) -> None:
     if errors:
         print(f"  [bq_io] insert errors (showing first 3): {errors[:3]}")
     else:
-        print(f"  [bq_io] ✓ {len(payload)} rows -> refresh_dates_v2")
+        print(f"  [bq_io] ✓ {len(payload)} rows -> {TABLE_NAME}")

@@ -54,6 +54,7 @@ from validation_prompt import VALIDATION_PROMPT_TEMPLATE
 from computer_use_extractor import tier6_computer_use
 import verification_recipes as vr
 import bq_io
+import gcs_io
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -85,9 +86,9 @@ def _safe_filename(s: str) -> str:
 
 def _write_log(serial: int, object_id: str, url: str, dataset_ids: list, log_lines: list, result: dict) -> str:
     """Writes the local .log file (useful for local runs) and returns the
-    same full text so it can be attached to the BigQuery row's detailed_log
-    column — Cloud Run's local filesystem disappears when the job exits, so
-    that column is the only durable copy of this detail in that environment.
+    same full text so it can be uploaded to GCS (see gcs_io.upload_log) —
+    Cloud Run's local filesystem disappears when the job exits, so that GCS
+    copy is the only durable copy of this detail in that environment.
 
     The filename is prefixed with the same serial number written to the CSV's
     serial_no column, so a row can be matched to its log file by eye without
@@ -370,9 +371,36 @@ def load_urls(csv_path: str) -> dict[str, list[str]]:
     return url_map
 
 
+# detailed_log is intentionally not a CSV column (would bloat the file;
+# local logs/<serial>_<object_id>.log already has it, matched by serial_no)
+# — extrasaction="ignore" lets the same row dict feed both the CSV writer
+# and (in bq mode) bq_io.write_results.
+CSV_FIELDNAMES = ["serial_no", "object_id", "url", "last_refresh_date", "date_method",
+                  "date_source", "tier_used", "date_found", "verification_steps",
+                  "tiers_attempted", "tier_failed_reason", "extraction_time_sec"]
+
+
+def _load_completed_urls(output_csv: str) -> tuple[set[str], int]:
+    """For --resume: reads an existing output CSV from a prior (possibly
+    killed) run and returns (URLs already processed, highest serial_no used)
+    so a re-run skips finished work instead of redoing it, and new serials
+    don't collide with existing log filenames."""
+    if not os.path.exists(output_csv):
+        return set(), 0
+    completed, max_serial = set(), 0
+    with open(output_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            completed.add(row.get("url", ""))
+            try:
+                max_serial = max(max_serial, int(row.get("serial_no") or 0))
+            except ValueError:
+                pass
+    return completed, max_serial
+
+
 async def main(input_csv: str | None, output_csv: str, limit: int | None,
                source: str, billing_project: str, random_sample: bool = False,
-               write_bq: bool = True):
+               write_bq: bool = True, resume: bool = False):
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     if source == "bq":
@@ -386,6 +414,17 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
     all_urls = list(url_map.keys())
     if limit:
         all_urls = random.sample(all_urls, min(limit, len(all_urls))) if random_sample else all_urls[:limit]
+
+    start_serial = 1
+    append_mode = False
+    if resume:
+        completed_urls, max_serial = _load_completed_urls(output_csv)
+        before = len(all_urls)
+        all_urls = [u for u in all_urls if u not in completed_urls]
+        start_serial = max_serial + 1
+        append_mode = bool(completed_urls)
+        print(f"--resume: {before - len(all_urls)} URLs already in {output_csv}, {len(all_urls)} remaining")
+
     print(f"Loaded {len(url_map)} unique URLs ({sum(len(v) for v in url_map.values())} dataset ids); running {len(all_urls)}")
 
     global_sem = asyncio.Semaphore(TIER012_CONCURRENCY)
@@ -393,57 +432,66 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
     tier6_sem  = asyncio.Semaphore(TIER6_CONCURRENCY)
     connector = aiohttp.TCPConnector(ssl=False, limit=TIER012_CONCURRENCY)
 
-    results = []
+    # Written per-URL as each one finishes (not batched to the very end) —
+    # so a killed process (a Chromebook going to sleep, a dropped SSH
+    # session) leaves a valid, resumable CSV instead of losing everything.
+    csv_file = open(output_csv, "a" if append_mode else "w", newline="", encoding="utf-8")
+    csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDNAMES, extrasaction="ignore")
+    if not append_mode:
+        csv_writer.writeheader()
+        csv_file.flush()
+
+    found = 0
+    total_rows = 0
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [process_url(session, url, url_map[url], serial, global_sem, gemini_sem, tier6_sem)
-                 for serial, url in enumerate(all_urls, start=1)]
+                 for serial, url in enumerate(all_urls, start=start_serial)]
         done = 0
         for coro in asyncio.as_completed(tasks):
             r = await coro
             done += 1
             tier_label = f"T{r['tier']}" if r.get("tier") is not None else "miss"
             print(f"  [{done}/{len(all_urls)}] {tier_label}  {r['date'] or '—':<12}  {r['url'][:70]}")
-            results.append(r)
 
-    csv_rows = []
-    for r in results:
-        for oid in url_map[r["url"]]:
-            csv_rows.append({
-                "serial_no":           r["serial"],
-                "object_id":           oid,
-                "url":                 r["url"],
-                "last_refresh_date":   r["date"],
-                "date_method":         vr.method_label(r["tier"], r["source"]),
-                "date_source":         r["source"],
-                "tier_used":           r["tier"],
-                "date_found":          bool(r["date"]),
-                "verification_steps":  r.get("verification_steps"),
-                "tiers_attempted":     r.get("tiers_attempted", ""),
-                "tier_failed_reason":  r.get("error"),
-                "extraction_time_sec": r.get("extraction_time_sec"),
-                "detailed_log":        r.get("detailed_log", ""),
-            })
+            # Upload once per URL (not once per dataset_id sharing it) — all
+            # rows for this URL point at the same log, same as the local
+            # logs/<serial>_<object_id>.log file already does.
+            log_gcs_uri = ""
+            if source == "bq" and write_bq:
+                log_gcs_uri = gcs_io.upload_log(
+                    billing_project, url_map[r["url"]][0], r["serial"], r.get("detailed_log", ""))
 
-    # detailed_log is intentionally not a CSV column (would bloat the file;
-    # local logs/<serial>_<object_id>.log already has it, matched by serial_no)
-    # — extrasaction="ignore" lets the same csv_rows list feed both the CSV
-    # and (in bq mode) bq_io.write_results.
-    fieldnames = ["serial_no", "object_id", "url", "last_refresh_date", "date_method",
-                  "date_source", "tier_used", "date_found", "verification_steps",
-                  "tiers_attempted", "tier_failed_reason", "extraction_time_sec"]
-    with open(output_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(csv_rows)
+            bq_rows_this_url = []
+            for oid in url_map[r["url"]]:
+                row = {
+                    "serial_no":           r["serial"],
+                    "object_id":           oid,
+                    "url":                 r["url"],
+                    "last_refresh_date":   r["date"],
+                    "date_method":         vr.method_label(r["tier"], r["source"]),
+                    "date_source":         r["source"],
+                    "tier_used":           r["tier"],
+                    "date_found":          bool(r["date"]),
+                    "verification_steps":  r.get("verification_steps"),
+                    "tiers_attempted":     r.get("tiers_attempted", ""),
+                    "tier_failed_reason":  r.get("error"),
+                    "extraction_time_sec": r.get("extraction_time_sec"),
+                    "log_gcs_uri":         log_gcs_uri,
+                }
+                csv_writer.writerow(row)
+                total_rows += 1
+                if row["date_found"]:
+                    found += 1
+                bq_rows_this_url.append(row)
+            csv_file.flush()   # survive a kill/sleep between completions, not just at the end
+            if source == "bq" and write_bq:
+                bq_io.write_results(billing_project, run_id, bq_rows_this_url)
 
-    found = sum(1 for r in csv_rows if r["date_found"])
+    csv_file.close()
     print(f"\nResults saved -> {output_csv}")
-    print(f"Found date: {found}/{len(csv_rows)} ({found * 100 // max(len(csv_rows), 1)}%)")
-
-    if source == "bq" and write_bq:
-        bq_io.write_results(billing_project, run_id, csv_rows)
-    elif source == "bq":
-        print("(--no-bq-write set — skipped writing to refresh_dates_v2, results are only in the local CSV)")
+    print(f"Found date: {found}/{max(total_rows, 1)} ({found * 100 // max(total_rows, 1)}%)")
+    if source == "bq" and not write_bq:
+        print("(--no-bq-write set — skipped writing to data_freshness_report, results are only in the local CSV)")
 
 
 if __name__ == "__main__":
@@ -452,13 +500,13 @@ if __name__ == "__main__":
                     help="where to read the URL list from (default: bq)")
     ap.add_argument("--input",  default=None, help="required when --source csv")
     ap.add_argument("--output", default=os.path.join(os.path.dirname(__file__), "staleness_results.csv"))
-    ap.add_argument("--billing-project", default=os.environ.get("GCP_PROJECT", "datcom-infosys-dev"),
-                    help="GCP project used to run the BQ query job and to hold refresh_dates_v2")
+    ap.add_argument("--billing-project", default=os.environ.get("GCP_PROJECT", "datcom-import-dev-768877"),
+                    help="GCP project used to run the BQ query job and to hold data_freshness_report + the log bucket")
     ap.add_argument("--limit",  type=int, default=None, help="cap number of URLs (for testing)")
     ap.add_argument("--random", action="store_true",
                     help="with --limit N, pick N random URLs instead of the first N (e.g. for a representative smoke test)")
     ap.add_argument("--no-bq-write", action="store_true",
-                    help="with --source bq: still fetch input from BigQuery, but only write the local CSV — skip refresh_dates_v2 entirely")
+                    help="with --source bq: still fetch input from BigQuery, but only write the local CSV — skip data_freshness_report and the GCS log upload entirely")
     args = ap.parse_args()
     asyncio.run(main(args.input, args.output, args.limit, args.source, args.billing_project,
                       args.random, not args.no_bq_write))
