@@ -458,8 +458,12 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
             # logs/<serial>_<object_id>.log file already does.
             log_gcs_uri = ""
             if source == "bq" and write_bq:
-                log_gcs_uri = gcs_io.upload_log(
-                    billing_project, url_map[r["url"]][0], r["serial"], r.get("detailed_log", ""))
+                try:
+                    log_gcs_uri = gcs_io.upload_log(
+                        billing_project, url_map[r["url"]][0], r["serial"], r.get("detailed_log", ""))
+                except Exception as e:
+                    print(f"  [gcs_io] log upload failed for {r['url'][:70]} ({type(e).__name__}: {e}) — "
+                          f"continuing without it (local logs/ still has the full log)")
 
             bq_rows_this_url = []
             for oid in url_map[r["url"]]:

@@ -144,8 +144,14 @@ def write_results(billing_project: str, run_id: str, rows: list[dict]) -> None:
         }
         for r in rows
     ]
-    errors = _client(billing_project).insert_rows_json(_table(billing_project), payload)
-    if errors:
-        print(f"  [bq_io] insert errors (showing first 3): {errors[:3]}")
-    else:
-        print(f"  [bq_io] ✓ {len(payload)} rows -> {TABLE_NAME}")
+    try:
+        errors = _client(billing_project).insert_rows_json(_table(billing_project), payload)
+        if errors:
+            print(f"  [bq_io] insert errors (showing first 3): {errors[:3]}")
+        else:
+            print(f"  [bq_io] ✓ {len(payload)} rows -> {TABLE_NAME}")
+    except Exception as e:
+        # A transient BQ failure (network blip, quota, permission hiccup) must
+        # not take down the whole run — the local CSV already has this data;
+        # this row just won't have made it into data_freshness_report yet.
+        print(f"  [bq_io] insert failed ({type(e).__name__}: {e}) — continuing, local CSV still has this data")
