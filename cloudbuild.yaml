@@ -67,5 +67,9 @@ images:
   - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:$COMMIT_SHA"
   - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:latest"
 
-options:
-  logging: CLOUD_LOGGING_ONLY
+# Deliberately NOT setting logging: CLOUD_LOGGING_ONLY here — on a Cloud
+# Logging-restricted org (logs routed through a custom sink regular project
+# viewers can't see), that leaves no way to read build logs at all. Default
+# (LEGACY) mode also writes a plain log file to a Cloud Storage bucket,
+# which is unaffected by any Cloud Logging sink routing and is always
+# readable from the build's own "View raw log" link.
