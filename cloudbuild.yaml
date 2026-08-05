@@ -1,0 +1,71 @@
+# Full CI pipeline for the staleness-pipeline-v2 Cloud Run Job — build, push,
+# and deploy in one Cloud Build run. Repo is flat (Dockerfile + source all at
+# root), so the build context is just ".".
+#
+# Trigger a build+deploy manually from the repo root:
+#   gcloud builds submit --config cloudbuild.yaml .
+#
+# Or wire this up as a Cloud Build trigger (e.g. on push to main) so it
+# deploys automatically.
+
+steps:
+  # Step 0: pull the previous image for layer caching (ok if it fails on first run)
+  - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        docker pull us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:latest || exit 0
+
+  # Step 1: build the image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--cache-from"
+      - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:latest"
+      - "-t"
+      - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:$COMMIT_SHA"
+      - "-t"
+      - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:latest"
+      - "."
+
+  # Step 2: push both tags to Artifact Registry
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "--all-tags"
+      - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2"
+
+  # Step 3: deploy as a Cloud Run JOB (not a Service — no port needed, this is
+  # a batch run over the URL list, not a request-serving process)
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        gcloud run jobs update staleness-pipeline-v2 \
+          --image "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:$COMMIT_SHA" \
+          --region us-central1 \
+          --memory 8Gi \
+          --cpu 4 \
+          --task-timeout 86400 \
+          --max-retries 1 \
+          --set-env-vars "GCP_PROJECT=datcom-import-dev-768877,BQ_DATASET=dc_kg_dashboard,GCS_BUCKET=datcom-import-dev-768877-staleness-logs,PIPELINE_SOURCE=bq" \
+          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest,GITHUB_TOKEN=github-token:latest,GROQ_API_KEY=groq-api-key:latest" \
+        2>/dev/null || \
+        gcloud run jobs create staleness-pipeline-v2 \
+          --image "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:$COMMIT_SHA" \
+          --region us-central1 \
+          --memory 8Gi \
+          --cpu 4 \
+          --task-timeout 86400 \
+          --max-retries 0 \
+          --set-env-vars "GCP_PROJECT=datcom-import-dev-768877,BQ_DATASET=dc_kg_dashboard,GCS_BUCKET=datcom-import-dev-768877-staleness-logs,PIPELINE_SOURCE=bq" \
+          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest,GITHUB_TOKEN=github-token:latest,GROQ_API_KEY=groq-api-key:latest"
+
+images:
+  - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:$COMMIT_SHA"
+  - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:latest"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
