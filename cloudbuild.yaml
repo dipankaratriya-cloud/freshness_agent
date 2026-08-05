@@ -51,17 +51,17 @@ steps:
           --task-timeout 86400 \
           --max-retries 1 \
           --set-env-vars "GCP_PROJECT=datcom-import-dev-768877,BQ_DATASET=dc_kg_dashboard,GCS_BUCKET=datcom-import-dev-768877-staleness-logs,PIPELINE_SOURCE=bq" \
-          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest,GITHUB_TOKEN=github-token:latest,GROQ_API_KEY=groq-api-key:latest" \
+          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest" \
         2>/dev/null || \
         gcloud run jobs create staleness-pipeline-v2 \
           --image "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:$COMMIT_SHA" \
           --region us-central1 \
-          --memory 8Gi \
-          --cpu 4 \
+          --memory 32Gi \
+          --cpu 8 \
           --task-timeout 86400 \
           --max-retries 0 \
           --set-env-vars "GCP_PROJECT=datcom-import-dev-768877,BQ_DATASET=dc_kg_dashboard,GCS_BUCKET=datcom-import-dev-768877-staleness-logs,PIPELINE_SOURCE=bq" \
-          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest,GITHUB_TOKEN=github-token:latest,GROQ_API_KEY=groq-api-key:latest"
+          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest"
 
 images:
   - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:$COMMIT_SHA"
