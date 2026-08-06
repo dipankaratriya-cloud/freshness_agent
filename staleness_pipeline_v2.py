@@ -6,7 +6,12 @@ Gemini text reasoning, Playwright static render — were removed outright: log
 analysis showed their real yield was negligible next to their cost, and
 everything they could find, computer-use can also find):
 
-  Tier 0 : specialized_source_handlers.SPECIALIZED_HANDLERS (direct API/vintage)
+  Tier 0 : GitHub tree URLs only (specialized_source_handlers.handle_github_tree)
+           — every other domain-specific handler (humdata, NASA NCCS, NDAP,
+           EPA FTP, wikidata, Census vintage-year) was found to produce wrong
+           answers often enough (e.g. identical dates across clearly distinct
+           datasets) that they were removed outright rather than trusted; a
+           non-GitHub URL now goes straight to Tier 1 instead.
   Tier 1 : Gemini computer-use (gemini-3.6-flash) — real browser, clicks/scrolls;
            also detects a real file download mid-session
   Tier 2 : download + plain-Gemini-API file inspection — a hand-off from within
@@ -35,12 +40,9 @@ from datetime import datetime, timezone
 import aiohttp
 from dotenv import load_dotenv
 
-from provenance_refresh_extractor import _parse_date, classify_url, _tier1
-# _tier1 (plain HTTP HEAD -> Last-Modified) is kept only as a helper for the
-# wikidata handler's internal redirect resolution below — it is NOT a cascade
-# tier anymore (the old Tier 1/2/3/4 steps were removed outright).
+from provenance_refresh_extractor import _parse_date, classify_url
 from specialized_source_handlers import (
-    SPECIALIZED_HANDLERS, handle_census_url_vintage, normalize_url, classify_blocker,
+    _GITHUB_TREE_RE, handle_github_tree, normalize_url, classify_blocker,
 )
 
 from computer_use_extractor import tier1_computer_use
@@ -144,33 +146,24 @@ async def process_url(session: aiohttp.ClientSession, url: str,
         return _finish(), log_lines
 
     async with global_sem:
-        # Tier 0
-        for pattern, handler in SPECIALIZED_HANDLERS:
-            if not pattern.search(url):
-                continue
-            log_fn(f"=== TIER 0: matched handler {handler.__name__} ===")
+        # Tier 0 — GitHub tree URLs only. Every other domain-specific handler
+        # (humdata, NASA NCCS, NDAP, EPA FTP, wikidata, Census vintage-year)
+        # was found to produce wrong answers too often — e.g. the humdata
+        # handler returned the exact same date for clearly distinct
+        # per-country datasets, a strong tell it was reading a platform-level
+        # timestamp rather than a per-dataset one — so they were removed
+        # outright rather than trusted; only the GitHub commits-API handler
+        # (ground-truth-verified correct) stays.
+        if _GITHUB_TREE_RE.search(url):
+            log_fn(f"=== TIER 0: matched handler handle_github_tree ===")
             tried.append(0)
-            r0 = await handler(url, session)
-            if r0 and r0.get("_redirect_url"):
-                # A handler-internal redirect resolution (e.g. the wikidata handler
-                # pointing at query.wikidata.org) — not the removed generic Tier 1,
-                # just this one handler's own HTTP HEAD follow-up. Still labeled tier 0.
-                log_fn(f"Handler redirected to {r0['_redirect_url']}")
-                r_redirect = await _tier1(session, r0["_redirect_url"])
-                if r_redirect:
-                    r_redirect["source"] = f"{r_redirect.get('source', 'Last-Modified header')} (via {r0['_redirect_url']})"
-                    r_redirect["tier"] = 0
-                    result.update(r_redirect)
-                    result["verification_steps"] = vr.recipe_tier0(handler.__name__, url, result["date"])
-                    return _finish(), log_lines
-            elif r0 and r0.get("date"):
+            r0 = await handle_github_tree(url, session)
+            if r0 and r0.get("date"):
                 log_fn(f"Handler found date={r0.get('date')}")
                 result.update(r0)
-                result["verification_steps"] = vr.recipe_tier0(handler.__name__, url, result["date"])
+                result["verification_steps"] = vr.recipe_tier0("handle_github_tree", url, result["date"])
                 return _finish(), log_lines
-            else:
-                log_fn("Handler matched but found nothing, falling through to tier 1")
-            break
+            log_fn("Handler matched but found nothing, falling through to tier 1")
 
         # Tier 1 — Gemini computer-use (real browser). May internally hand off
         # to Tier 2 (download + plain-Gemini-API file inspection) if it detects a real file
@@ -190,14 +183,6 @@ async def process_url(session: aiohttp.ClientSession, url: str,
                     url, r1.get("action_trace", []), r1["source"], r1["date"])
             return _finish(), log_lines
         log_fn(f"Tier 1 error: {r1.get('error')}")
-
-        # Absolute last resort: Census ACS vintage year embedded in the URL
-        r0_census = await handle_census_url_vintage(url, session)
-        if r0_census and r0_census.get("date"):
-            log_fn(f"Last-resort Census vintage fallback found {r0_census.get('date')}")
-            tried.append(0)
-            result.update(r0_census)
-            result["verification_steps"] = vr.recipe_tier0("handle_census_url_vintage", url, result["date"])
         return _finish(), log_lines
 
 

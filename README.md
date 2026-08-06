@@ -71,7 +71,7 @@ points at it.
 
 | Tier | Method | Notes |
 |---|---|---|
-| 0 | `specialized_source_handlers.SPECIALIZED_HANDLERS` + Census vintage-year fallback | direct API/vintage-year handlers, no LLM; Census fallback retried as absolute last resort if Tier 1/2 both fail |
+| 0 | `specialized_source_handlers.handle_github_tree` (GitHub tree URLs only) | direct GitHub commits-API call, no LLM. Every other domain-specific handler (humdata, NASA NCCS, NDAP, EPA FTP, wikidata, Census vintage-year) was removed after log analysis showed they produced wrong answers too often (e.g. the humdata handler returning the exact same date for clearly distinct per-country datasets) — a non-GitHub URL now skips Tier 0 entirely and goes straight to Tier 1 |
 | 1 | **Gemini computer-use** (`gemini-3.6-flash`) | real headless browser: screenshots, clicks, scrolls, navigates, up to 40 actions; also detects a real file download starting mid-session |
 | 2 | Download + **plain Gemini API** file inspection | not an independent fallback — a hand-off from *within* a live Tier 1 session when it triggers an actual file download instead of a rendered page; the file is saved, the browser session ends, and `file_date_extractor.extract_date_from_file()` inspects it via two plain Gemini API calls (no agent, no subprocess) — see below |
 
@@ -91,7 +91,7 @@ described above.
 |---|---|
 | `staleness_pipeline_v2.py` | main orchestrator — `process_url()` runs the Tier 0/1/2 cascade on one URL, `process_entity()` wraps it with the sourcedataurl→provenance_url fallback and owns per-entity logging, `main()` loads entities and drives the run |
 | `provenance_refresh_extractor.py` | Tier 0's date-parsing helpers (`_parse_date`, `classify_url`), plus its own Groq-based Tier 3/5 functions, which exist in this file but are unused here |
-| `specialized_source_handlers.py` | Tier 0's direct-API/vintage-year handlers (`SPECIALIZED_HANDLERS`) |
+| `specialized_source_handlers.py` | Tier 0's GitHub commits-API handler (`handle_github_tree`) — the only handler this pipeline still uses; the file's other domain handlers exist but are no longer imported here |
 | `computer_use_prompt.py` | prompt text for the Tier 1 Gemini computer-use tier |
 | `computer_use_extractor.py` | Tier 1 implementation (`tier1_computer_use`) — Playwright action execution, safety-decision handling, action-trace logging, and the Tier 2 download hand-off (`_save_download`/`_inspect_downloaded_file`); also runnable standalone |
 | `file_date_extractor.py` | Tier 2's file-inspection logic — two Gemini calls, no coding agent, no subprocess: Step A picks which column represents the observation period from a small file preview; Step B reads every distinct value in that column across the whole file (no row-count cap) and asks Gemini 3.1 Pro to identify the max from that complete list — handles real-world messiness (mixed types, inconsistent formats) that hand-written parsing code kept breaking on, confirmed against a real 80k-row UN data export. Replaces an earlier pi-coding-agent-CLI-based version, removed after that tool was found to violate policy for use on Google source/data |

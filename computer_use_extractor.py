@@ -137,15 +137,6 @@ async def _execute(page, name: str, args: dict) -> str | None:
     return None
 
 
-# Same recency guard as Tier 3/5 in provenance_refresh_extractor.py
-# (_fails_llm_recency_guard): a range-end timestamp like "Availability
-# 2015-06-27 - 2026-07-29T00:42:...Z" is a dynamically generated "as of
-# right now" pointer, not a real refresh event — confirmed live during
-# smoke testing (developers.google.com Earth Engine catalog page returned
-# today's exact timestamp as the "refresh date").
-_RECENCY_GUARD_DAYS = 7
-
-
 def _parse_final_answer(text: str) -> dict | None:
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     try:
@@ -155,11 +146,16 @@ def _parse_final_answer(text: str) -> dict | None:
     val = str(data.get("date") or "").strip()
     if not val or val.upper() in ("NULL", "NONE", "N/A"):
         return None
+    # Bare years are accepted here (e.g. a wide-format table's column header
+    # like "Population (2013)") — same reasoning as Tier 2's
+    # _validate_tier2_date(): a year read directly off the page/table is the
+    # real answer, not an ambiguous scraped decoy.
+    if re.fullmatch(r"\d{4}", val):
+        year = int(val)
+        return {"date": val, "source": data.get("source", "computer-use")} if 2000 <= year <= _date.today().year + 1 else None
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", val):
         return None
     if not (2000 <= int(val[:4]) <= _date.today().year + 1) or val > _date.today().isoformat():
-        return None
-    if (_date.today() - _date.fromisoformat(val)).days < _RECENCY_GUARD_DAYS:
         return None
     return {"date": val, "source": data.get("source", "computer-use")}
 
