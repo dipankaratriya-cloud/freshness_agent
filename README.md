@@ -73,7 +73,7 @@ points at it.
 |---|---|---|
 | 0 | `specialized_source_handlers.SPECIALIZED_HANDLERS` + Census vintage-year fallback | direct API/vintage-year handlers, no LLM; Census fallback retried as absolute last resort if Tier 1/2 both fail |
 | 1 | **Gemini computer-use** (`gemini-3.6-flash`) | real headless browser: screenshots, clicks, scrolls, navigates, up to 40 actions; also detects a real file download starting mid-session |
-| 2 | Download + **pi coding agent** file inspection | not an independent fallback — a hand-off from *within* a live Tier 1 session when it triggers an actual file download instead of a rendered page; the file is saved, the browser session ends, and `pi_date_extractor.extract_date_with_pi()` inspects the file directly |
+| 2 | Download + **plain Gemini API** file inspection | not an independent fallback — a hand-off from *within* a live Tier 1 session when it triggers an actual file download instead of a rendered page; the file is saved, the browser session ends, and `file_date_extractor.extract_date_from_file()` inspects it via two plain Gemini API calls (no agent, no subprocess) — see below |
 
 An earlier design had additional Tiers 1-4 (HTTP HEAD, HTML parse, Gemini
 text reasoning, Playwright static render) and a Tier 5 (Groq `compound-beta`
@@ -94,11 +94,11 @@ described above.
 | `specialized_source_handlers.py` | Tier 0's direct-API/vintage-year handlers (`SPECIALIZED_HANDLERS`) |
 | `computer_use_prompt.py` | prompt text for the Tier 1 Gemini computer-use tier |
 | `computer_use_extractor.py` | Tier 1 implementation (`tier1_computer_use`) — Playwright action execution, safety-decision handling, action-trace logging, and the Tier 2 download hand-off (`_save_download`/`_inspect_downloaded_file`); also runnable standalone |
-| `pi_date_extractor.py` | Tier 2's file-inspection agent — shells out to the `pi` CLI (`gemini-3.1-pro-preview`) to read a downloaded file and extract the last observation date |
+| `file_date_extractor.py` | Tier 2's file-inspection logic — two Gemini calls, no coding agent, no subprocess: Step A picks which column represents the observation period from a small file preview; Step B reads every distinct value in that column across the whole file (no row-count cap) and asks Gemini 3.1 Pro to identify the max from that complete list — handles real-world messiness (mixed types, inconsistent formats) that hand-written parsing code kept breaking on, confirmed against a real 80k-row UN data export. Replaces an earlier pi-coding-agent-CLI-based version, removed after that tool was found to violate policy for use on Google source/data |
 | `verification_recipes.py` | builds the auto-generated, plain-English `verification_steps` recipe for every row, one function per tier, plus `recipe_fallback_url()`/`recipe_no_date_fallback()` for the two-attempt case |
 | `bq_io.py` | BigQuery I/O — the live source query (`ProvenanceEntity` records), `data_freshness_report` table creation, and writing results |
 | `gcs_io.py` | uploads each entity's detailed log to `gs://datcom-import-dev-768877-staleness-logs/` and returns the `gs://` URI stored in the BQ row's `log_gcs_uri` column |
-| `Dockerfile` | Cloud Run Job image — now also installs Node + the `pi` CLI (needed by Tier 2's hand-off) alongside the Python/Playwright deps. Auth is non-interactive: `pi` reads `GEMINI_API_KEY` straight from the environment, injected as a secret in `cloudbuild.yaml`'s deploy step — confirmed with a live local smoke test of the `pi` CLI itself, but **not yet confirmed inside an actual Cloud Run execution** |
+| `Dockerfile` | Cloud Run Job image — plain Python/Playwright deps only; no agent CLI, no Node, nothing beyond `pip install` |
 | `cloudbuild.yaml` | full CI pipeline — builds, pushes to Artifact Registry, then deploys the `staleness-pipeline-v2` Cloud Run Job |
 | `deploy.sh` | thin wrapper that sets the project and calls `cloudbuild.yaml` via `gcloud builds submit` |
 
@@ -114,7 +114,7 @@ an LLM after the fact), e.g.:
 
 - Tier 0: `STEP 1: matched domain-specific handler ... STEP 3: Handler returned date -> <date>.`
 - Tier 1: the full numbered action sequence (`clicked X (intent: ...)`, `navigated to Y`, ...) ending in the model's cited source
-- Tier 2: continues Tier 1's action sequence, then `a real file download started ... handed off to the pi coding agent ... read column '<col>' -> <date>.`
+- Tier 2: continues Tier 1's action sequence, then `a real file download started ... handed off to plain-Gemini-API file inspection ... identified column '<col>' -> <date>.`
 - Miss: lists which tiers were attempted
 
 ## Run locally
@@ -182,11 +182,9 @@ with valid Application Default Credentials got `403 Access Denied` running
 this query without the grant — so it's a real prerequisite, not a
 hypothetical one.
 
-**Tier 2's auth**: the pi CLI reads `GEMINI_API_KEY` straight from the
-environment, already injected as a secret in `cloudbuild.yaml`'s deploy step
-— confirmed with a live local smoke test of the `pi` CLI itself, but not yet
-confirmed inside an actual Cloud Run execution. Verify Tier 2 actually works
-on the first real run before trusting its results from this job.
+**Tier 2's auth**: it's a plain Gemini API call, so it needs nothing beyond
+the same `GEMINI_API_KEY` every other tier already uses — no separate
+CLI/install/auth step.
 
 ## Testing the fallback cascade
 
