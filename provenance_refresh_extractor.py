@@ -26,11 +26,24 @@ from collections import defaultdict
 from datetime import date as _date, datetime
 from urllib.parse import urlparse
 
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+VENV_SITE_PACKAGES = os.path.join(
+    REPO_ROOT,
+    ".venv",
+    "lib",
+    f"python{sys.version_info.major}.{sys.version_info.minor}",
+    "site-packages",
+)
+if os.path.isdir(VENV_SITE_PACKAGES) and VENV_SITE_PACKAGES not in sys.path:
+    sys.path.insert(0, VENV_SITE_PACKAGES)
+
 from dateutil import parser as _dateparser
 from dateutil.parser import ParserError as _ParserError
 
 import aiohttp
 from bs4 import BeautifulSoup
+
+from playwright_utils import launch_playwright_browser
 from dotenv import load_dotenv
 
 from specialized_source_handlers import (
@@ -42,8 +55,21 @@ from specialized_source_handlers import (
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-from groq import Groq as _Groq
-_groq_client = _Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+
+def _get_groq_client():
+    """Create the Groq client lazily so the pipeline can run without Groq configured."""
+    try:
+        from groq import Groq as _Groq
+    except Exception:
+        return None
+
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return None
+    return _Groq(api_key=api_key)
+
+
+_groq_client = None
 
 # ── logging ───────────────────────────────────────────────────────────────────
 # Every tier previously swallowed its own exceptions with a bare `except: pass`,
@@ -450,6 +476,13 @@ def _tier3_sync(page_text: str, url: str) -> dict | None:
             "Return ONLY valid JSON, no markdown, no explanation: "
             '{"date": "YYYY-MM-DD or null", "source": "exact quoted phrase from the page text you used"}'
         )
+        global _groq_client
+        if _groq_client is None:
+            _groq_client = _get_groq_client()
+        if _groq_client is None:
+            logger.info(f"tier3 {url}: Groq not configured; skipping")
+            return None
+
         logger.info(f"tier3 {url}: invoking Groq openai/gpt-oss-120b (page_text_len={len(page_text)})")
         logger.debug(f"tier3 {url}: prompt sent:\n{prompt}")
         resp = _groq_client.chat.completions.create(
@@ -480,7 +513,7 @@ async def _tier4(url: str) -> dict | None:
         from playwright.async_api import async_playwright
         logger.debug(f"tier4 {url}: launching headless Chromium")
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await launch_playwright_browser(p, headless=True)
             page = await browser.new_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
             await page.wait_for_timeout(2000)
@@ -513,6 +546,13 @@ async def _tier4(url: str) -> dict | None:
 def _tier5_sync(url: str) -> dict | None:
     """Groq compound-beta: real browser visit — handles bot walls and JS-heavy sites."""
     try:
+        global _groq_client
+        if _groq_client is None:
+            _groq_client = _get_groq_client()
+        if _groq_client is None:
+            logger.info(f"tier5 {url}: Groq not configured; skipping")
+            return None
+
         logger.info(f"tier5 {url}: invoking Groq compound-beta (real-browsing agent)")
         resp = _groq_client.chat.completions.create(
             model="compound-beta",

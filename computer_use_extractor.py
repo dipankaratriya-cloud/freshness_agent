@@ -1,21 +1,29 @@
 """
-Tier 6 — Gemini Computer Use fallback.
+Tier 1 — Gemini Computer Use, with a Tier 2 download+pi-agent hand-off.
 
-Runs AFTER the existing 5-tier cascade (provenance_refresh_extractor.py) has
-already tried and failed for a URL. Drives a real Playwright browser with
-Gemini's computer-use tool — it looks at screenshots and decides where to
-click/scroll/navigate — to find the last-refresh date visually, for pages
-where no static HTML fetch (Tier 0-5) could locate one.
+Runs AFTER Tier 0's domain-specific handlers have already tried and failed for
+a URL. Drives a real Playwright browser with Gemini's computer-use tool — it
+looks at screenshots and decides where to click/scroll/navigate — to find the
+last-refresh date visually, for pages where no direct handler could locate one.
+
+If, mid-session, the browser starts an actual file download (rather than
+rendering a page) instead of trying to make the model reason about a page it
+fundamentally cannot open, the browser session ends there and now hands off to
+the pi coding agent (pi_date_extractor.py, same directory) to inspect the
+downloaded file directly and extract the real last-observation date — see
+tier2_download_and_inspect() below. This pipeline used to also gate on Tiers
+1-5 (HTTP HEAD, HTML parse, Gemini text reasoning, Playwright static render,
+Groq real-browsing); all of those were removed outright as low-yield.
 
 Setup:
   pip install google-genai playwright
   playwright install chromium
-  export GEMINI_API_KEY=...   (or set it in ../.env)
+  export GEMINI_API_KEY=...   (or set it in .env)
 
 Run:
-  python3 experiment2/computer_use_extractor.py \\
+  python3 computer_use_extractor.py \\
       --input provenance_refresh_dates.json \\
-      --output experiment2/computer_use_results.json \\
+      --output computer_use_results.json \\
       --limit 10
 """
 
@@ -24,6 +32,8 @@ import asyncio
 import json
 import os
 import re
+import shutil
+import tempfile
 from datetime import date as _date
 
 from dotenv import load_dotenv
@@ -31,6 +41,8 @@ from google import genai
 from google.genai import types
 
 from computer_use_prompt import TASK_PROMPT_TEMPLATE
+from pi_date_extractor import extract_date_with_pi
+from provenance_refresh_extractor import _parse_date  # same strict date parser every other tier uses
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -38,11 +50,13 @@ MODEL        = "gemini-3.6-flash"
 MAX_STEPS    = 40          # actions per URL before giving up — generous now that cost isn't the constraint;
                            # still bounded so one pathological URL can't stall the whole batch run indefinitely
 CONCURRENCY  = 3           # real browsers + a slow multimodal model — keep this low
+                           # (the pipeline itself uses TIER1_CONCURRENCY instead of this
+                           # module-level default — see staleness_pipeline_v2.py)
 VIEWPORT     = {"width": 1440, "height": 900}
 
 _api_key = os.environ.get("GEMINI_API_KEY", "")
 if not _api_key:
-    raise SystemExit("GEMINI_API_KEY is not set (checked ../.env and environment)")
+    raise SystemExit("GEMINI_API_KEY is not set (checked .env and environment)")
 _client = genai.Client(api_key=_api_key)
 
 _TOOL_CONFIG = types.GenerateContentConfig(
@@ -153,7 +167,7 @@ def _noop_log(_msg: str) -> None:
 async def _screenshot_with_retry(page, log_fn=_noop_log, retries: int = 2, delay: float = 1.5):
     """page.screenshot() intermittently fails on transient rendering hiccups
     (e.g. a font-load timeout inside Chromium's screenshot protocol) — this
-    killed whole Tier 6 attempts mid-exploration with budget still remaining
+    killed whole Tier 1 attempts mid-exploration with budget still remaining
     (confirmed live: a metadata-modal case died here with 12 steps left).
     Retries a couple of times before giving up. Returns None — not raising —
     when the page/browser is genuinely gone (TargetClosedError), since no
@@ -173,20 +187,83 @@ async def _screenshot_with_retry(page, log_fn=_noop_log, retries: int = 2, delay
     return None
 
 
-async def tier6_computer_use(url: str, sem: asyncio.Semaphore, log_fn=_noop_log) -> dict:
+async def _save_download(download, log_fn=_noop_log) -> tuple[str | None, str]:
+    """Saves a Playwright Download to a fresh temp directory — must be called
+    while the browser/context that produced it is still open. Returns
+    (filepath, tmpdir); filepath is None if saving failed, but tmpdir is
+    always returned so the caller can clean it up either way."""
+    tmpdir = tempfile.mkdtemp(prefix="tier2_download_")
+    try:
+        filename = download.suggested_filename or "downloaded_file"
+        filepath = os.path.join(tmpdir, filename)
+        await download.save_as(filepath)
+        log_fn(f"=== TIER 2: real file download detected, saved to {filepath} ===")
+        return filepath, tmpdir
+    except Exception as e:
+        log_fn(f"Failed to save detected download: {type(e).__name__}: {e}")
+        return None, tmpdir
+
+
+def _inspect_downloaded_file(filepath: str, log_fn=_noop_log) -> dict:
+    """Hands an already-saved, already-downloaded file to
+    pi_date_extractor.extract_date_with_pi() (reused completely unmodified —
+    it already does exactly this file-inspection work elsewhere in the repo).
+    Call only after the browser has been closed; the pi agent works on the
+    file directly via bash/pandas, not the browser. Returns {"date", "source",
+    "error", "column_used"} — no "tier"/"steps_used"/"action_trace", since the
+    caller (tier1_computer_use) already tracks those and merges this in."""
+    try:
+        last_obs_date, column_used, files_checked = extract_date_with_pi(filepath)
+        log_fn(f"pi agent returned last_obs_date={last_obs_date!r} column={column_used!r} "
+               f"files_checked={files_checked}")
+    except Exception as e:
+        log_fn(f"pi agent EXCEPTION {type(e).__name__}: {e}")
+        return {"date": None, "source": None, "error": f"pi agent failed: {type(e).__name__}: {e}"}
+
+    if not last_obs_date or last_obs_date == "not_possible":
+        return {"date": None, "source": None,
+                "error": "pi agent could not determine a date from the downloaded file"}
+
+    # The pi agent allows bare-year answers ("YYYY"); every other tier in this
+    # pipeline rejects them via the same _parse_date() call — apply the same
+    # rule here so Tier 2 isn't looser than the rest of the cascade.
+    val = _parse_date(str(last_obs_date))
+    if not val:
+        log_fn(f"pi agent date {last_obs_date!r} rejected by _parse_date (e.g. a bare year) — treating as a miss")
+        return {"date": None, "source": None,
+                "error": f"pi agent returned an unusable date: {last_obs_date!r}"}
+
+    return {"date": val, "source": f"downloaded file, column '{column_used}'",
+            "error": None, "column_used": column_used}
+
+
+async def tier1_computer_use(url: str, sem: asyncio.Semaphore, log_fn=_noop_log) -> dict:
     """Drives a real browser with Gemini's computer-use tool.
     Returns {"date", "source", "tier", "steps_used", "error", "action_trace"} —
     date/source are None on failure. action_trace is a list of
     {"step", "action", "args", "intent", "error"} dicts, one per action taken,
-    used both for the per-URL log and for building the Tier 6 verification
-    recipe (see verification_recipes.recipe_tier6)."""
+    used both for the per-URL log and for building the Tier 1 verification
+    recipe (see verification_recipes.recipe_tier1_computer_use).
+
+    If a real file download starts mid-session (rather than a page
+    rendering), the browser session ends there and this hands off to the pi
+    coding agent instead — the returned dict then has "tier": 2 and
+    "downloaded_file"/"column_used" fields instead of a computer-use source."""
     from playwright.async_api import async_playwright
 
     async with sem:
-        log_fn(f"=== TIER 6: Gemini computer-use ({MODEL}) ===")
+        log_fn(f"=== TIER 1: Gemini computer-use ({MODEL}) ===")
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page(viewport=VIEWPORT)
+
+            # Checked once per loop iteration (not polled separately) so the
+            # common no-download path pays zero extra latency. A sync append
+            # here is safe — save_as() is awaited later, once we've decided
+            # to hand off.
+            pending_downloads: list = []
+            page.on("download", lambda d: pending_downloads.append(d))
+
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=20000)
                 await page.wait_for_timeout(1500)
@@ -194,10 +271,26 @@ async def tier6_computer_use(url: str, sem: asyncio.Semaphore, log_fn=_noop_log)
             except Exception as e:
                 log_fn(f"Initial navigation failed ({type(e).__name__}: {e}) — letting the model see whatever loaded")
 
+            if pending_downloads:
+                log_fn("Navigating directly to this URL triggered a file download — handing off to Tier 2")
+                filepath, tmpdir = await _save_download(pending_downloads[0], log_fn)
+                await browser.close()
+                if filepath is None:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    return {"date": None, "source": None, "tier": 1, "steps_used": 0,
+                            "error": "download detected but could not be saved", "action_trace": []}
+                try:
+                    inspected = await asyncio.get_event_loop().run_in_executor(
+                        None, _inspect_downloaded_file, filepath, log_fn)
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                return {**inspected, "tier": 2 if inspected.get("date") else 1,
+                        "steps_used": 0, "action_trace": [], "downloaded_file": filepath}
+
             shot = await _screenshot_with_retry(page, log_fn)
             if shot is None:
                 await browser.close()
-                return {"date": None, "source": None, "tier": 6, "steps_used": 0,
+                return {"date": None, "source": None, "tier": 1, "steps_used": 0,
                         "error": "browser/page closed unexpectedly before the first screenshot",
                         "action_trace": []}
             prompt_text = TASK_PROMPT_TEMPLATE.format(url=url, max_steps=MAX_STEPS)
@@ -207,8 +300,12 @@ async def tier6_computer_use(url: str, sem: asyncio.Semaphore, log_fn=_noop_log)
                 types.Part.from_bytes(data=shot, mime_type="image/png"),
             ])]
 
-            result = {"date": None, "source": None, "tier": 6, "steps_used": 0,
+            result = {"date": None, "source": None, "tier": 1, "steps_used": 0,
                       "error": None, "action_trace": []}
+            # Set when the loop below detects a download and breaks out —
+            # checked once after the browser is closed (see the finally block)
+            # so there is only ever one place that closes the browser.
+            download_filepath, download_tmpdir = None, None
             try:
                 for step in range(MAX_STEPS):
                     response = await asyncio.get_event_loop().run_in_executor(
@@ -255,6 +352,13 @@ async def tier6_computer_use(url: str, sem: asyncio.Semaphore, log_fn=_noop_log)
                         "step": step + 1, "action": fc.name, "args": fc_args,
                         "intent": intent, "error": err,
                     })
+
+                    if pending_downloads:
+                        log_fn(f"[step {step + 1}] Detected a real file download mid-session — "
+                               f"ending the browser session, handing off to Tier 2")
+                        download_filepath, download_tmpdir = await _save_download(pending_downloads[0], log_fn)
+                        break
+
                     new_shot = await _screenshot_with_retry(page, log_fn)
                     if new_shot is None:
                         log_fn(f"[step {step + 1}] Could not capture a screenshot after this action "
@@ -287,6 +391,23 @@ async def tier6_computer_use(url: str, sem: asyncio.Semaphore, log_fn=_noop_log)
                 log_fn(f"RESULT: EXCEPTION {type(e).__name__}: {e}")
             finally:
                 await browser.close()
+
+            if download_tmpdir is not None:
+                if download_filepath is None:
+                    shutil.rmtree(download_tmpdir, ignore_errors=True)
+                    result["error"] = "download detected but could not be saved"
+                    return result
+                try:
+                    inspected = await asyncio.get_event_loop().run_in_executor(
+                        None, _inspect_downloaded_file, download_filepath, log_fn)
+                finally:
+                    shutil.rmtree(download_tmpdir, ignore_errors=True)
+                result.update(inspected)
+                result["downloaded_file"] = download_filepath
+                if inspected.get("date"):
+                    result["tier"] = 2
+                return result
+
             return result
 
 
@@ -294,7 +415,7 @@ async def main(input_path: str, output_path: str, limit: int | None):
     with open(input_path) as f:
         existing = json.load(f)
 
-    # Tier 6 targets URLs, not dataset ids — many ids can share one failed URL.
+    # Tier 1 targets URLs, not dataset ids — many ids can share one failed URL.
     misses_by_url: dict[str, list[str]] = {}
     for did, v in existing.items():
         if not v.get("date_found") and v.get("url"):
@@ -303,10 +424,10 @@ async def main(input_path: str, output_path: str, limit: int | None):
     urls = list(misses_by_url.keys())
     if limit:
         urls = urls[:limit]
-    print(f"{len(misses_by_url)} unique failed URLs, running Tier 6 on {len(urls)}")
+    print(f"{len(misses_by_url)} unique failed URLs, running Tier 1 on {len(urls)}")
 
     sem = asyncio.Semaphore(CONCURRENCY)
-    results = await asyncio.gather(*[tier6_computer_use(u, sem) for u in urls])
+    results = await asyncio.gather(*[tier1_computer_use(u, sem) for u in urls])
 
     output = dict(existing)
     resolved = 0
@@ -317,16 +438,16 @@ async def main(input_path: str, output_path: str, limit: int | None):
             output[did].update({
                 "last_refresh_date":  r["date"] or output[did]["last_refresh_date"],
                 "date_source":        r["source"] or output[did]["date_source"],
-                "tier_used":          6 if r["date"] else output[did]["tier_used"],
+                "tier_used":          r["tier"] if r["date"] else output[did]["tier_used"],
                 "date_found":         bool(r["date"]) or output[did]["date_found"],
-                "tier6_steps_used":   r["steps_used"],
-                "tier6_error":        r["error"],
+                "tier1_steps_used":   r["steps_used"],
+                "tier1_error":        r["error"],
             })
         print(f"  {'FOUND ' + r['date'] if r['date'] else 'miss  '}  ({r['steps_used']} steps)  {url[:70]}")
 
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
-    print(f"\nResolved {resolved}/{len(urls)} via Tier 6 -> {output_path}")
+    print(f"\nResolved {resolved}/{len(urls)} via Tier 1/2 -> {output_path}")
 
 
 if __name__ == "__main__":
