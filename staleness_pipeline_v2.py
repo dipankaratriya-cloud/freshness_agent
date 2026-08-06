@@ -9,7 +9,7 @@ everything they could find, computer-use can also find):
   Tier 0 : specialized_source_handlers.SPECIALIZED_HANDLERS (direct API/vintage)
   Tier 1 : Gemini computer-use (gemini-3.6-flash) — real browser, clicks/scrolls;
            also detects a real file download mid-session
-  Tier 2 : download + pi coding agent file inspection — a hand-off from within
+  Tier 2 : download + plain-Gemini-API file inspection — a hand-off from within
            an in-progress Tier 1 session when it triggers an actual file
            download instead of a rendered page (see computer_use_extractor.py)
 
@@ -173,7 +173,7 @@ async def process_url(session: aiohttp.ClientSession, url: str,
             break
 
         # Tier 1 — Gemini computer-use (real browser). May internally hand off
-        # to Tier 2 (download + pi coding agent) if it detects a real file
+        # to Tier 2 (download + plain-Gemini-API file inspection) if it detects a real file
         # download mid-session — see computer_use_extractor.tier1_computer_use.
         tried.append(1)
         r1 = await tier1_computer_use(url, tier1_sem, log_fn)

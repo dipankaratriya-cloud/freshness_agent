@@ -51,8 +51,8 @@ def recipe_tier2_download(url: str, action_trace: list, filepath: str, date: str
         steps.append(desc)
     n = len(action_trace) + 2
     steps.append(f"STEP {n}: a real file download started (`{filepath}`) instead of a rendered "
-                  f"page — the browser session ended and control handed off to the pi coding agent.")
-    steps.append(f"STEP {n + 1}: pi agent inspected the downloaded file, read column `{column_used}` -> {date}.")
+                  f"page — the browser session ended and control handed off to plain-Gemini-API file inspection.")
+    steps.append(f"STEP {n + 1}: read the downloaded file, identified column `{column_used}` -> {date}.")
     return " ".join(steps)
 
 
@@ -102,5 +102,5 @@ def method_label(tier_used, date_source: str) -> str:
     if tier_used == 1:
         return "Gemini computer-use (browser navigation)"
     if tier_used == 2:
-        return "Downloaded file + pi coding agent inspection"
+        return "Downloaded file + Gemini API inspection"
     return f"Tier {tier_used}"

@@ -1,5 +1,5 @@
 """
-Tier 1 — Gemini Computer Use, with a Tier 2 download+pi-agent hand-off.
+Tier 1 — Gemini Computer Use, with a Tier 2 download+file-inspection hand-off.
 
 Runs AFTER Tier 0's domain-specific handlers have already tried and failed for
 a URL. Drives a real Playwright browser with Gemini's computer-use tool — it
@@ -9,11 +9,15 @@ last-refresh date visually, for pages where no direct handler could locate one.
 If, mid-session, the browser starts an actual file download (rather than
 rendering a page) instead of trying to make the model reason about a page it
 fundamentally cannot open, the browser session ends there and now hands off to
-the pi coding agent (pi_date_extractor.py, same directory) to inspect the
-downloaded file directly and extract the real last-observation date — see
-tier2_download_and_inspect() below. This pipeline used to also gate on Tiers
+plain-Gemini-API file inspection (file_date_extractor.py, repo root) to read
+the downloaded file directly and extract the real last-observation date — see
+tier2_download_and_inspect() below. This whole file used to also gate on Tiers
 1-5 (HTTP HEAD, HTML parse, Gemini text reasoning, Playwright static render,
-Groq real-browsing); all of those were removed outright as low-yield.
+Groq real-browsing); all of those were removed outright as low-yield. Tier 2
+also used to shell out to a third-party coding-agent CLI (pi-coding-agent) —
+that was replaced with a plain two-step Gemini API call (no agent, no
+subprocess) after that tool was found to violate policy for use on Google
+source/data.
 
 Setup:
   pip install google-genai playwright
@@ -41,7 +45,7 @@ from google import genai
 from google.genai import types
 
 from computer_use_prompt import TASK_PROMPT_TEMPLATE
-from pi_date_extractor import extract_date_with_pi
+from file_date_extractor import extract_date_from_file
 from provenance_refresh_extractor import _parse_date  # same strict date parser every other tier uses
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -204,34 +208,52 @@ async def _save_download(download, log_fn=_noop_log) -> tuple[str | None, str]:
         return None, tmpdir
 
 
+def _validate_tier2_date(raw: str) -> "str | None":
+    """Tier 2's own validation — same as _parse_date() for anything with
+    real day/month precision, but ALSO accepts a bare 4-digit year as-is
+    (still range-checked). Every OTHER tier rejects bare years via
+    _parse_date() because a lone year scraped from a page is usually an
+    ambiguous decoy (a copyright notice, etc.). That reasoning doesn't apply
+    to Tier 2's wide-format case: the year there is the file's own real
+    column header — genuine tabular data, not a scraped decoy — so rejecting
+    it the same way would silently defeat the reason wide-format support
+    exists in Tier 2 at all."""
+    raw = raw.strip()
+    if re.fullmatch(r"\d{4}", raw):
+        year = int(raw)
+        return raw if (2000 <= year <= _date.today().year + 1) else None
+    return _parse_date(raw)
+
+
 def _inspect_downloaded_file(filepath: str, log_fn=_noop_log) -> dict:
     """Hands an already-saved, already-downloaded file to
-    pi_date_extractor.extract_date_with_pi() (reused completely unmodified —
-    it already does exactly this file-inspection work elsewhere in the repo).
-    Call only after the browser has been closed; the pi agent works on the
-    file directly via bash/pandas, not the browser. Returns {"date", "source",
-    "error", "column_used"} — no "tier"/"steps_used"/"action_trace", since the
-    caller (tier1_computer_use) already tracks those and merges this in."""
+    file_date_extractor.extract_date_from_file() — two plain Gemini API calls
+    (pick the right column, then identify its max from every distinct
+    full-file value), no agent/subprocess involved. Call only after the
+    browser has been closed; this works on the file directly via pandas, not
+    the browser. Returns {"date", "source", "error", "column_used"} — no
+    "tier"/"steps_used"/"action_trace", since the caller (tier1_computer_use)
+    already tracks those and merges this in."""
     try:
-        last_obs_date, column_used, files_checked = extract_date_with_pi(filepath)
-        log_fn(f"pi agent returned last_obs_date={last_obs_date!r} column={column_used!r} "
+        last_obs_date, column_used, files_checked = extract_date_from_file(filepath)
+        log_fn(f"file inspection returned last_obs_date={last_obs_date!r} column={column_used!r} "
                f"files_checked={files_checked}")
     except Exception as e:
-        log_fn(f"pi agent EXCEPTION {type(e).__name__}: {e}")
-        return {"date": None, "source": None, "error": f"pi agent failed: {type(e).__name__}: {e}"}
+        log_fn(f"file inspection EXCEPTION {type(e).__name__}: {e}")
+        return {"date": None, "source": None, "error": f"file inspection failed: {type(e).__name__}: {e}"}
 
     if not last_obs_date or last_obs_date == "not_possible":
         return {"date": None, "source": None,
-                "error": "pi agent could not determine a date from the downloaded file"}
+                "error": "could not determine a date from the downloaded file"}
 
-    # The pi agent allows bare-year answers ("YYYY"); every other tier in this
-    # pipeline rejects them via the same _parse_date() call — apply the same
-    # rule here so Tier 2 isn't looser than the rest of the cascade.
-    val = _parse_date(str(last_obs_date))
+    # Bare years ARE accepted here (see _validate_tier2_date) — unlike every
+    # other tier, a wide-format year is the file's own real column header,
+    # not an ambiguous scraped decoy.
+    val = _validate_tier2_date(str(last_obs_date))
     if not val:
-        log_fn(f"pi agent date {last_obs_date!r} rejected by _parse_date (e.g. a bare year) — treating as a miss")
+        log_fn(f"date {last_obs_date!r} rejected by _validate_tier2_date (out of range / unparseable) — treating as a miss")
         return {"date": None, "source": None,
-                "error": f"pi agent returned an unusable date: {last_obs_date!r}"}
+                "error": f"returned an unusable date: {last_obs_date!r}"}
 
     return {"date": val, "source": f"downloaded file, column '{column_used}'",
             "error": None, "column_used": column_used}
