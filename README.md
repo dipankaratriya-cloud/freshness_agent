@@ -50,7 +50,7 @@ local inspection either way): `run_timestamp, serial_no, object_id,
 sourcedataurl, provenance_url, url_used, last_refresh_date, date_method,
 date_source, tier_used, date_found, verification_steps, tiers_attempted,
 tier_failed_reason, extraction_time_sec`. `run_timestamp` is the same
-`YYYYMMDD_HHMMSS` (UTC) value across every row of one run — it's the same
+`YYYY-MM-DD HH:MM:SS UTC` value across every row of one run — it's the same
 string passed as `run_id` to the BQ side, so a local CSV and its matching BQ
 rows can be cross-referenced by this value.
 

@@ -331,7 +331,7 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
                source: str, billing_project: str, random_sample: bool = False,
                write_bq: bool = True, resume: bool = False,
                entity_id_filter: list[str] | None = None):
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_id = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     if source == "bq":
         if write_bq:
