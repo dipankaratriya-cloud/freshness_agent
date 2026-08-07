@@ -11,11 +11,19 @@ Input:  SOURCE_QUERY reads the live provenance graph from datcom-store, owned
         the object — validated live this session: 429 sourceDataUrl edges,
         432 output rows after a small, accepted join fan-out on ~5 entities
         that have more than one `url` edge; not deduped here by design).
-Output: data_freshness_report in datcom-import-dev-768877.dc_kg_dashboard — a
-        shared dashboard table (this pipeline is one of potentially several
-        writers into it). Append-only: one row per dataset per run. Full
-        per-URL logs live in GCS (see gcs_io.py); this table stores only the
-        gs:// URI pointing at each one, not the log text itself.
+Output: Freshness_results in datcom-import-dev-768877.dc_kg_dashboard —
+        this pipeline's own table (the older data_freshness_report table is
+        no longer written to as of the 5-project quota fan-out; historical
+        rows there are untouched but this is the sole output going forward).
+        Append-only: one row per dataset per run. Full per-URL logs live in
+        GCS under gs://freshness_logs/<run folder>/ (see gcs_io.py); this
+        table stores only the gs:// URI pointing at each one, not the log
+        text itself. Schema has exactly one run-identifying column
+        (run_timestamp, TIMESTAMP) rather than the old run_id/created_at/
+        updated_at/last_execution_date spread, and leads with the three
+        columns straight from SOURCE_QUERY (provenance, sourcedataurl,
+        provenance_url) plus url_used — the primary columns a dashboard
+        consumer needs first.
 
 NOTE: the billing project (whichever project runs the query job) needs
 `roles/bigquery.jobUser` there, AND the identity needs read access on
@@ -26,16 +34,15 @@ needs its own BigQuery write access, granted independently of datcom-store.
 """
 
 import os
-from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import datetime
 
 from google.cloud import bigquery
 
 from specialized_source_handlers import normalize_url
 
 BQ_DATASET = os.environ.get("BQ_DATASET", "dc_kg_dashboard")
-TABLE_NAME = "data_freshness_report"
+TABLE_NAME = "Freshness_results"
 _client_cache: dict[str, bigquery.Client] = {}
 
 # Switched from the staging dataset (dc_graph_staging_2026_07_28) to prod
@@ -70,25 +77,25 @@ class ProvenanceEntity:
     provenance_url_candidates: list[str] = field(default_factory=list)
 
 
-# object_id now holds the correct entity id (e1.subject_id) rather than the
-# old literal-node id — a deliberate, accepted change to this live table's
-# existing column meaning (see plan). sourcedataurl/provenance_url are raw
-# graph values, not "whichever URL was fetched"; url_used records that.
-DATA_FRESHNESS_REPORT_SCHEMA = [
-    bigquery.SchemaField("run_id",              "STRING"),
-    bigquery.SchemaField("last_execution_date", "DATE"),
-    bigquery.SchemaField("created_at",          "TIMESTAMP"),
-    bigquery.SchemaField("updated_at",          "TIMESTAMP"),
-    bigquery.SchemaField("serial_no",           "INT64"),
-    bigquery.SchemaField("object_id",           "STRING"),
+# Column order is deliberate, not alphabetical/historical: the three columns
+# straight from SOURCE_QUERY (provenance, sourcedataurl, provenance_url) come
+# first — "provenance" holds the true entity id (e1.subject_id), replacing
+# the old table's "object_id" name outright, not just its meaning — followed
+# by run_timestamp (the one and only run-identifying column) and url_used
+# (which of the two URLs above actually produced the result). Everything
+# after that is secondary/diagnostic.
+FRESHNESS_RESULTS_SCHEMA = [
+    bigquery.SchemaField("provenance",          "STRING"),
     bigquery.SchemaField("sourcedataurl",       "STRING"),
     bigquery.SchemaField("provenance_url",      "STRING"),
+    bigquery.SchemaField("run_timestamp",       "TIMESTAMP"),
     bigquery.SchemaField("url_used",            "STRING"),
+    bigquery.SchemaField("serial_no",           "INT64"),
     bigquery.SchemaField("last_refresh_date",   "STRING"),
+    bigquery.SchemaField("date_found",          "BOOL"),
     bigquery.SchemaField("date_method",         "STRING"),
     bigquery.SchemaField("date_source",         "STRING"),
     bigquery.SchemaField("tier_used",           "INT64"),
-    bigquery.SchemaField("date_found",          "BOOL"),
     bigquery.SchemaField("verification_steps",  "STRING"),
     bigquery.SchemaField("tiers_attempted",     "STRING"),
     bigquery.SchemaField("tier_failed_reason",  "STRING"),
@@ -151,7 +158,7 @@ def ensure_table(billing_project: str) -> None:
     try:
         existing = client.get_table(table_ref)
         existing_fields = {f.name for f in existing.schema}
-        new_fields = [f for f in DATA_FRESHNESS_REPORT_SCHEMA if f.name not in existing_fields]
+        new_fields = [f for f in FRESHNESS_RESULTS_SCHEMA if f.name not in existing_fields]
         if new_fields:
             existing.schema = list(existing.schema) + new_fields
             client.update_table(existing, ["schema"])
@@ -159,16 +166,21 @@ def ensure_table(billing_project: str) -> None:
         else:
             print(f"  [bq_io] table ready: {table_ref}")
     except Exception:
-        t = bigquery.Table(table_ref, schema=DATA_FRESHNESS_REPORT_SCHEMA)
-        t.time_partitioning = bigquery.TimePartitioning(field="last_execution_date")
-        t.clustering_fields = ["object_id"]
+        t = bigquery.Table(table_ref, schema=FRESHNESS_RESULTS_SCHEMA)
+        t.time_partitioning = bigquery.TimePartitioning(field="run_timestamp")
+        t.clustering_fields = ["provenance"]
         client.create_table(t, exists_ok=True)
         print(f"  [bq_io] table created: {table_ref}")
 
 
-def write_results(billing_project: str, run_id: str, rows: list[dict]) -> None:
+def write_results(billing_project: str, run_started_at: datetime, rows: list[dict]) -> None:
     """rows: the same per-entity dicts staleness_pipeline_v2.main() builds
     for the CSV, plus a 'log_gcs_uri' key (see gcs_io.upload_log).
+
+    run_started_at is the single datetime shared by every row of one pipeline
+    run (main() computes it once) — this table has exactly one run-identifying
+    column (run_timestamp), not the old run_id/created_at/updated_at/
+    last_execution_date spread.
 
     sourcedataurl/provenance_url are the raw graph values for this entity
     (not "whichever URL was fetched") — url_used records that separately,
@@ -176,24 +188,20 @@ def write_results(billing_project: str, run_id: str, rows: list[dict]) -> None:
     result. See ProvenanceEntity / process_entity for how these are populated."""
     if not rows:
         return
-    today = str(date.today())
-    now = datetime.now(timezone.utc).isoformat()
+    run_timestamp = run_started_at.isoformat()
     payload = [
         {
-            "run_id":              run_id,
-            "last_execution_date": today,
-            "created_at":          now,
-            "updated_at":          now,
-            "serial_no":           r.get("serial_no"),
-            "object_id":           r.get("object_id", ""),
+            "provenance":          r.get("provenance", ""),
             "sourcedataurl":       r.get("sourcedataurl", ""),
             "provenance_url":      r.get("provenance_url", ""),
+            "run_timestamp":       run_timestamp,
             "url_used":            r.get("url_used", ""),
+            "serial_no":           r.get("serial_no"),
             "last_refresh_date":   r.get("last_refresh_date"),
+            "date_found":          bool(r.get("date_found")),
             "date_method":         r.get("date_method"),
             "date_source":         r.get("date_source"),
             "tier_used":           r.get("tier_used"),
-            "date_found":          bool(r.get("date_found")),
             "verification_steps":  r.get("verification_steps"),
             "tiers_attempted":     r.get("tiers_attempted", ""),
             "tier_failed_reason":  r.get("tier_failed_reason"),
@@ -211,5 +219,5 @@ def write_results(billing_project: str, run_id: str, rows: list[dict]) -> None:
     except Exception as e:
         # A transient BQ failure (network blip, quota, permission hiccup) must
         # not take down the whole run — the local CSV already has this data;
-        # this row just won't have made it into data_freshness_report yet.
+        # this row just won't have made it into Freshness_results yet.
         print(f"  [bq_io] insert failed ({type(e).__name__}: {e}) — continuing, local CSV still has this data")

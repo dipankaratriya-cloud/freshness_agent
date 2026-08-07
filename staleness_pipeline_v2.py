@@ -239,7 +239,7 @@ async def process_entity(session: aiohttp.ClientSession, entity, serial: int,
     def _finalize(result: dict, url_used: str, log_lines: list, urls_tried: list,
                   verification_steps: str | None = None) -> dict:
         final = dict(result)
-        final["object_id"] = entity.entity_id
+        final["provenance"] = entity.entity_id
         final["sourcedataurl"] = sourcedataurl
         final["provenance_url"] = provenance_url
         final["url_used"] = url_used
@@ -322,20 +322,24 @@ def load_urls(csv_path: str) -> list["bq_io.ProvenanceEntity"]:
     return entities
 
 
-# detailed_log is intentionally not a CSV column (would bloat the file;
-# local logs/<serial>_<object_id>.log already has it, matched by serial_no)
-# — extrasaction="ignore" lets the same row dict feed both the CSV writer
-# and (in bq mode) bq_io.write_results.
-CSV_FIELDNAMES = ["run_timestamp", "serial_no", "object_id", "sourcedataurl", "provenance_url", "url_used",
-                  "last_refresh_date", "date_method", "date_source", "tier_used", "date_found",
-                  "verification_steps", "tiers_attempted", "tier_failed_reason", "extraction_time_sec"]
+# Column order follows bq_io.FRESHNESS_RESULTS_SCHEMA: the three columns
+# straight from SOURCE_QUERY (provenance, sourcedataurl, provenance_url)
+# first, then the one run-identifying column (run_timestamp) and url_used,
+# then everything secondary/diagnostic. detailed_log is intentionally not a
+# CSV column (would bloat the file; local logs/<serial>_<provenance>.log
+# already has it, matched by serial_no) — extrasaction="ignore" lets the
+# same row dict feed both the CSV writer and (in bq mode) bq_io.write_results.
+CSV_FIELDNAMES = ["provenance", "sourcedataurl", "provenance_url", "run_timestamp", "url_used",
+                  "serial_no", "last_refresh_date", "date_found", "date_method", "date_source",
+                  "tier_used", "verification_steps", "tiers_attempted", "tier_failed_reason",
+                  "extraction_time_sec"]
 
 
 def _load_completed_entities(output_csv: str) -> tuple[set[str], int]:
     """For --resume: reads an existing output CSV from a prior (possibly
     killed) run and returns (entity ids already processed, highest serial_no
     used) so a re-run skips finished work instead of redoing it, and new
-    serials don't collide with existing log filenames. Keyed by object_id
+    serials don't collide with existing log filenames. Keyed by provenance
     (the entity id) rather than url — a URL alone no longer uniquely
     identifies "already done" since two different entities can share one."""
     if not os.path.exists(output_csv):
@@ -343,7 +347,7 @@ def _load_completed_entities(output_csv: str) -> tuple[set[str], int]:
     completed, max_serial = set(), 0
     with open(output_csv, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            completed.add(row.get("object_id", ""))
+            completed.add(row.get("provenance", ""))
             try:
                 max_serial = max(max_serial, int(row.get("serial_no") or 0))
             except ValueError:
@@ -355,7 +359,9 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
                source: str, billing_project: str, random_sample: bool = False,
                write_bq: bool = True, resume: bool = False,
                entity_id_filter: list[str] | None = None):
-    run_id = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    run_started_at = datetime.now(timezone.utc)
+    run_id = run_started_at.strftime("%Y-%m-%d %H:%M:%S UTC")   # human-readable display copy for CSV/prints
+    run_log_folder = gcs_io.run_folder_name(run_started_at)      # gs://freshness_logs/<run_log_folder>/...
 
     if source == "bq":
         if write_bq:
@@ -437,29 +443,29 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
             tier_label = f"T{r['tier']}" if r.get("tier") is not None else "miss"
             shown_url = r.get("url_used") or r.get("url") or ""
             print(f"  [{done}/{len(indexed_entities)}] {tier_label}  {r['date'] or '—':<12}  "
-                  f"{r.get('object_id', '')[:40]}  {shown_url[:60]}")
+                  f"{r.get('provenance', '')[:40]}  {shown_url[:60]}")
 
             log_gcs_uri = ""
             if source == "bq" and write_bq:
                 try:
                     log_gcs_uri = gcs_io.upload_log(
-                        billing_project, r.get("object_id", ""), r["serial"], r.get("detailed_log", ""))
+                        billing_project, run_log_folder, r.get("provenance", ""), r["serial"], r.get("detailed_log", ""))
                 except Exception as e:
-                    print(f"  [gcs_io] log upload failed for {r.get('object_id', '')[:40]} "
+                    print(f"  [gcs_io] log upload failed for {r.get('provenance', '')[:40]} "
                           f"({type(e).__name__}: {e}) — continuing without it (local logs/ still has the full log)")
 
             row = {
-                "run_timestamp":       run_id,
-                "serial_no":           r["serial"],
-                "object_id":           r.get("object_id", ""),
+                "provenance":          r.get("provenance", ""),
                 "sourcedataurl":       r.get("sourcedataurl", ""),
                 "provenance_url":      r.get("provenance_url", ""),
+                "run_timestamp":       run_id,
                 "url_used":            r.get("url_used", ""),
+                "serial_no":           r["serial"],
                 "last_refresh_date":   r["date"],
+                "date_found":          bool(r["date"]),
                 "date_method":         vr.method_label(r["tier"], r["source"]),
                 "date_source":         r["source"],
                 "tier_used":           r["tier"],
-                "date_found":          bool(r["date"]),
                 "verification_steps":  r.get("verification_steps"),
                 "tiers_attempted":     r.get("tiers_attempted", ""),
                 "tier_failed_reason":  r.get("error"),
@@ -472,13 +478,13 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
                 found += 1
             csv_file.flush()   # survive a kill/sleep between completions, not just at the end
             if source == "bq" and write_bq:
-                bq_io.write_results(billing_project, run_id, [row])
+                bq_io.write_results(billing_project, run_started_at, [row])
 
     csv_file.close()
     print(f"\nResults saved -> {output_csv}")
     print(f"Found date: {found}/{max(total_rows, 1)} ({found * 100 // max(total_rows, 1)}%)")
     if source == "bq" and not write_bq:
-        print("(--no-bq-write set — skipped writing to data_freshness_report, results are only in the local CSV)")
+        print("(--no-bq-write set — skipped writing to Freshness_results, results are only in the local CSV)")
 
 
 if __name__ == "__main__":

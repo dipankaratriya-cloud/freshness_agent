@@ -38,34 +38,47 @@ during testing (see "Testing the fallback cascade" below).
 ## Output
 
 **BigQuery** (`--source bq`, the default): one row per entity in
-`<project>.dc_kg_dashboard.data_freshness_report` (auto-created/schema-migrated
-on startup by `bq_io.ensure_table()`) — a shared dashboard table, append-only,
-one row per entity per run. `object_id` is the entity's own true id
-(`e1.subject_id`). `sourcedataurl`/`provenance_url` are the two raw candidate
-values; `url_used` records whichever one actually produced (or was used to
-attempt) the row's result — see the CSV column list below for the rest.
+`<project>.dc_kg_dashboard.Freshness_results` (auto-created/schema-migrated on
+startup by `bq_io.ensure_table()` — see `bq_io.FRESHNESS_RESULTS_SCHEMA`). The
+older `data_freshness_report` table is no longer written to; its historical
+rows are untouched but this is the sole BQ output going forward. Column order
+is deliberate: the three columns straight from `SOURCE_QUERY` come first —
+`provenance` (the entity's own true id, `e1.subject_id` — this table calls it
+`provenance` outright rather than the old table's `object_id`), `sourcedataurl`,
+`provenance_url` — then the one and only run-identifying column
+(`run_timestamp`, `TIMESTAMP`) and `url_used` (whichever of the two URLs above
+actually produced the row's result); everything after that is
+secondary/diagnostic. There is no separate `run_id`/`created_at`/`updated_at`/
+`last_execution_date` spread like the old table had — one `run_timestamp` per
+run, shared by every row of that run.
 
 **`staleness_results.csv`** — written in both modes (small/cheap, useful for
-local inspection either way): `run_timestamp, serial_no, object_id,
-sourcedataurl, provenance_url, url_used, last_refresh_date, date_method,
-date_source, tier_used, date_found, verification_steps, tiers_attempted,
-tier_failed_reason, extraction_time_sec`. `run_timestamp` is the same
-`YYYY-MM-DD HH:MM:SS UTC` value across every row of one run — it's the same
-string passed as `run_id` to the BQ side, so a local CSV and its matching BQ
-rows can be cross-referenced by this value.
+local inspection either way), same column order as the BQ table:
+`provenance, sourcedataurl, provenance_url, run_timestamp, url_used, serial_no,
+last_refresh_date, date_found, date_method, date_source, tier_used,
+verification_steps, tiers_attempted, tier_failed_reason, extraction_time_sec`.
+`run_timestamp` is the same `YYYY-MM-DD HH:MM:SS UTC` string across every row
+of one run, so a local CSV and its matching BQ rows (there stored as a real
+`TIMESTAMP`, same instant) can be cross-referenced.
 
-**`logs/<serial>_<object_id>.log`** — one detailed log file per **entity**
-(not per URL — a URL can be reached via different entities in different
-roles), same content as the `detailed_log` BQ column: every tier attempted
-for every URL tried (both attempts, concatenated, when a fallback occurred),
-every Gemini prompt/response/reasoning ("thought") trace, and for Tier 1
-every browser action taken with its stated intent (plus, when a Tier 2
-hand-off occurs, the pi agent's own reasoning trace). On `--source bq`
-(unless `--no-bq-write` is set), each log is also uploaded to
-`gs://datcom-import-dev-768877-staleness-logs/<serial>_<object_id>.log` (see
-`gcs_io.py`) — that's the durable copy on Cloud Run, where the local
-filesystem disappears once the job exits; the BQ row's `log_gcs_uri` column
-points at it.
+**`gs://freshness_logs/<run folder>/<serial>_<provenance>.log`** (`gcs_io.py`)
+— one detailed log file per **entity** (not per URL — a URL can be reached via
+different entities in different roles), same content as the `detailed_log`
+in-memory field: every tier attempted for every URL tried (both attempts,
+concatenated, when a fallback occurred), every Gemini prompt/response/
+reasoning ("thought") trace, and for Tier 1 every browser action taken with
+its stated intent (plus, when a Tier 2 hand-off occurs, its own
+file-inspection reasoning trace). Every pipeline run gets its own folder
+(`gcs_io.run_folder_name()`) — a precise `YYYY-MM-DD_HH-MM-SS` timestamp for a
+local/single-task run, or `YYYY-MM-DD_<CLOUD_RUN_EXECUTION>` for a Cloud Run
+Job run (all tasks of one `--tasks N` execution share `CLOUD_RUN_EXECUTION`,
+which is what actually guarantees every task agrees on the same folder even
+though each task's own clock can be a few seconds off from the others').
+**The bucket itself is NOT auto-created** — run
+`create_freshness_logs_bucket.sh` once before the first run against this
+setup. Local `logs/<serial>_<provenance>.log` files are the same content,
+kept only on the machine that ran the pipeline — not uploaded anywhere on
+Cloud Run, where the GCS copy is the only durable copy.
 
 ## Tier cascade
 
@@ -96,8 +109,8 @@ described above.
 | `computer_use_extractor.py` | Tier 1 implementation (`tier1_computer_use`) — Playwright action execution, safety-decision handling, action-trace logging, and the Tier 2 download hand-off (`_save_download`/`_inspect_downloaded_file`); also runnable standalone |
 | `file_date_extractor.py` | Tier 2's file-inspection logic — two Gemini calls, no coding agent, no subprocess: Step A picks which column represents the observation period from a small file preview; Step B reads every distinct value in that column across the whole file (no row-count cap) and asks Gemini 3.1 Pro to identify the max from that complete list — handles real-world messiness (mixed types, inconsistent formats) that hand-written parsing code kept breaking on, confirmed against a real 80k-row UN data export. Replaces an earlier pi-coding-agent-CLI-based version, removed after that tool was found to violate policy for use on Google source/data |
 | `verification_recipes.py` | builds the auto-generated, plain-English `verification_steps` recipe for every row, one function per tier, plus `recipe_fallback_url()`/`recipe_no_date_fallback()` for the two-attempt case |
-| `bq_io.py` | BigQuery I/O — the live source query (`ProvenanceEntity` records), `data_freshness_report` table creation, and writing results |
-| `gcs_io.py` | uploads each entity's detailed log to `gs://datcom-import-dev-768877-staleness-logs/` and returns the `gs://` URI stored in the BQ row's `log_gcs_uri` column |
+| `bq_io.py` | BigQuery I/O — the live source query (`ProvenanceEntity` records), `Freshness_results` table creation, and writing results |
+| `gcs_io.py` | uploads each entity's detailed log to `gs://freshness_logs/<run folder>/` (one folder per pipeline run, see `run_folder_name()`) and returns the `gs://` URI stored in the BQ row's `log_gcs_uri` column |
 | `Dockerfile` | Cloud Run Job image — plain Python/Playwright deps only; no agent CLI, no Node, nothing beyond `pip install` |
 | `cloudbuild.yaml` | full CI pipeline — builds, pushes to Artifact Registry, then deploys the `staleness-pipeline-v2` Cloud Run Job |
 | `deploy.sh` | thin wrapper that sets the project and calls `cloudbuild.yaml` via `gcloud builds submit` |
