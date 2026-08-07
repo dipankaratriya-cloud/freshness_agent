@@ -331,7 +331,7 @@ def load_urls(csv_path: str) -> list["bq_io.ProvenanceEntity"]:
 # same row dict feed both the CSV writer and (in bq mode) bq_io.write_results.
 CSV_FIELDNAMES = ["provenance", "sourcedataurl", "provenance_url", "run_timestamp", "url_used",
                   "serial_no", "last_refresh_date", "date_found", "date_method", "date_source",
-                  "tier_used", "verification_steps", "tiers_attempted", "tier_failed_reason",
+                  "source_summary", "tier_used", "verification_steps", "tiers_attempted", "tier_failed_reason",
                   "extraction_time_sec"]
 
 
@@ -465,6 +465,7 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
                 "date_found":          bool(r["date"]),
                 "date_method":         vr.method_label(r["tier"], r["source"]),
                 "date_source":         r["source"],
+                "source_summary":      vr.source_summary(r["tier"], r["source"]),
                 "tier_used":           r["tier"],
                 "verification_steps":  r.get("verification_steps"),
                 "tiers_attempted":     r.get("tiers_attempted", ""),

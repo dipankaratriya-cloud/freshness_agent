@@ -89,6 +89,28 @@ def recipe_no_date_fallback(sourcedataurl: str, tiers_a: str,
     )
 
 
+def source_summary(tier_used, date_source: str) -> str:
+    """One short, plain-English sentence naming exactly where the date came
+    from — distinct from date_method (which just names the tier/category)
+    and verification_steps (the full numbered trace): this is the middle
+    ground for a validator scanning many rows who wants the specific
+    evidence without opening the full trace or decoding a raw date_source
+    code. Built purely from data already captured (tier_used + the same
+    date_source string every tier already returns) — no extra Gemini call."""
+    if tier_used is None or tier_used == "":
+        return "N/A — no date found"
+    tier_used = int(tier_used)
+    ds = date_source or "unknown"
+
+    if tier_used == 0:
+        return f"Fetched directly from a domain-specific API, no page scraping — {ds}"
+    if tier_used == 1:
+        return f"Gemini browsed the live page and cited this as the date's location: {ds}"
+    if tier_used == 2:
+        return f"Downloaded the dataset file itself and read the date from it — {ds}"
+    return f"Tier {tier_used} — {ds}"
+
+
 def method_label(tier_used, date_source: str) -> str:
     """Short, human-scannable answer to "how was this found" — a CSV column
     version of the same tier/source info recipe_* already turns into full

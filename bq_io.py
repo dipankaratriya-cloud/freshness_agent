@@ -83,7 +83,11 @@ class ProvenanceEntity:
 # the old table's "object_id" name outright, not just its meaning — followed
 # by run_timestamp (the one and only run-identifying column) and url_used
 # (which of the two URLs above actually produced the result). Everything
-# after that is secondary/diagnostic.
+# after that is secondary/diagnostic. source_summary sits next to
+# date_method/date_source specifically for validation/transparency — one
+# plain-English sentence naming exactly where the date was read from
+# (verification_recipes.source_summary()), short enough to scan across many
+# rows without opening the full verification_steps trace.
 FRESHNESS_RESULTS_SCHEMA = [
     bigquery.SchemaField("provenance",          "STRING"),
     bigquery.SchemaField("sourcedataurl",       "STRING"),
@@ -95,6 +99,7 @@ FRESHNESS_RESULTS_SCHEMA = [
     bigquery.SchemaField("date_found",          "BOOL"),
     bigquery.SchemaField("date_method",         "STRING"),
     bigquery.SchemaField("date_source",         "STRING"),
+    bigquery.SchemaField("source_summary",      "STRING"),
     bigquery.SchemaField("tier_used",           "INT64"),
     bigquery.SchemaField("verification_steps",  "STRING"),
     bigquery.SchemaField("tiers_attempted",     "STRING"),
@@ -201,6 +206,7 @@ def write_results(billing_project: str, run_started_at: datetime, rows: list[dic
             "date_found":          bool(r.get("date_found")),
             "date_method":         r.get("date_method"),
             "date_source":         r.get("date_source"),
+            "source_summary":      r.get("source_summary"),
             "tier_used":           r.get("tier_used"),
             "verification_steps":  r.get("verification_steps"),
             "tiers_attempted":     r.get("tiers_attempted", ""),

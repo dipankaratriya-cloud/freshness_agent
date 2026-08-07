@@ -52,11 +52,25 @@ secondary/diagnostic. There is no separate `run_id`/`created_at`/`updated_at`/
 `last_execution_date` spread like the old table had — one `run_timestamp` per
 run, shared by every row of that run.
 
+`source_summary` sits next to `date_method`/`date_source` specifically for
+validation/transparency (`verification_recipes.source_summary()`) — one short,
+plain-English sentence naming exactly where the date was read from, e.g.
+`"Fetched directly from a domain-specific API, no page scraping —
+github-commits-api:committer"` (Tier 0), `"Gemini browsed the live page and
+cited this as the date's location: <exact text/element>"` (Tier 1), or
+`"Downloaded the dataset file itself and read the date from it — downloaded
+file, column 'Year'"` (Tier 2). It's the middle ground between `date_source`
+(a terse code, or Tier 1's raw free-text citation) and `verification_steps`
+(the full numbered trace) — short enough to scan across many rows without
+opening the full trace, built purely from data already captured (no extra
+Gemini call).
+
 **`staleness_results.csv`** — written in both modes (small/cheap, useful for
 local inspection either way), same column order as the BQ table:
 `provenance, sourcedataurl, provenance_url, run_timestamp, url_used, serial_no,
-last_refresh_date, date_found, date_method, date_source, tier_used,
-verification_steps, tiers_attempted, tier_failed_reason, extraction_time_sec`.
+last_refresh_date, date_found, date_method, date_source, source_summary,
+tier_used, verification_steps, tiers_attempted, tier_failed_reason,
+extraction_time_sec`.
 `run_timestamp` is the same `YYYY-MM-DD HH:MM:SS UTC` string across every row
 of one run, so a local CSV and its matching BQ rows (there stored as a real
 `TIMESTAMP`, same instant) can be cross-referenced.
