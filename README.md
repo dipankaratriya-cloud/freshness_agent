@@ -137,18 +137,44 @@ Run image installs and authenticates it too — see the Dockerfile row above).
 **Concurrency**: `TIER0_CONCURRENCY` (default 15, env-var overridable) bounds
 the cheap Tier 0 handler HTTP calls; `TIER1_CONCURRENCY` (default 6, env-var
 overridable) bounds real browser+Gemini computer-use sessions and is shared
-with Tier 2's pi-agent hand-off (which only fires for the minority of URLs
-that trigger a real download, so one semaphore avoids either starving the
-other). 6 is a starting point sized for a local 32GB/8-core machine —
-computer-use sessions are Gemini-API/network bound rather than locally
-CPU-heavy, so this is worth tuning up or down empirically rather than
-trusting the default blindly. Both constants read `os.environ` at import
-time (`TIER0_CONCURRENCY=N python3 staleness_pipeline_v2.py ...` locally, or
+with Tier 2's file-inspection hand-off (which only fires for the minority of
+URLs that trigger a real download, so one semaphore avoids either starving
+the other). Both constants read `os.environ` at import time
+(`TIER0_CONCURRENCY=N python3 staleness_pipeline_v2.py ...` locally, or
 `--set-env-vars` on Cloud Run) so the same image/code can run a different
-value in Cloud Run's resource allocation than locally — `cloudbuild.yaml`'s
-`--set-env-vars` doesn't currently set `TIER1_CONCURRENCY`, so the deployed
-job runs at the code's default of 6; add it there if this job's 8Gi/4vCPU
-allocation turns out to need a lower value in practice.
+value in Cloud Run than locally. `cloudbuild.yaml`'s deploy step pins
+`TIER1_CONCURRENCY=3` (down from the code's local-machine default of 6) —
+found the hard way that Gemini's rate limits (`429 RESOURCE_EXHAUSTED`) are a
+real, easy-to-hit ceiling at higher concurrency on a real production-sized
+batch (see below).
+
+**Multi-project quota fan-out**: Gemini API rate limits are enforced
+**per GCP project**, not per API key — running more workers under one
+project's key just means more contention for the same quota, not more real
+throughput (confirmed directly: this is what caused a `429`/`503` storm on a
+432-entity production run). If genuinely separate
+projects/billing accounts are available, `_resolve_gemini_api_key()` lets
+each Cloud Run Job task draw from its own independent quota pool instead:
+
+- Deploy with `--tasks N --parallelism N` — Cloud Run automatically sets
+  `CLOUD_RUN_TASK_INDEX` (0 to N-1) and `CLOUD_RUN_TASK_COUNT` in every task's
+  container.
+- `main()` shards the entity list `1/N` per task (`indexed_entities[task_index::task_count]`)
+  — serial numbers are assigned against the *full* list before slicing, so
+  they stay globally unique/meaningful across all tasks rather than every
+  task restarting its own numbering at 1.
+- `_resolve_gemini_api_key()` swaps in `GEMINI_API_KEY_<task_index>` (if set)
+  in place of the shared `GEMINI_API_KEY`, *before* `computer_use_extractor`/
+  `file_date_extractor` are imported (both read the key at import time).
+- Falls back to the plain shared `GEMINI_API_KEY` untouched for local runs
+  and single-task jobs, where `CLOUD_RUN_TASK_INDEX` simply won't be set —
+  this is fully backward compatible, not a required setup.
+
+`cloudbuild.yaml`'s deploy step is wired for 5 tasks/5 separate projects —
+`GEMINI_API_KEY_0` through `GEMINI_API_KEY_4`, each mapped from its own
+Secret Manager secret (placeholder names `gemini-api-key-project-0` through
+`-4` — create these ahead of time, one per project's key, and rename the
+mapping if you use different secret names).
 
 ## Deploy to Cloud Run
 

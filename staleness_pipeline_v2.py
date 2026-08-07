@@ -40,6 +40,32 @@ from datetime import datetime, timezone
 import aiohttp
 from dotenv import load_dotenv
 
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+
+def _resolve_gemini_api_key() -> None:
+    """Multi-project quota fan-out: Gemini API rate limits are enforced per
+    GCP PROJECT, not per API key — running N Cloud Run Job tasks all under
+    one project's key would just mean N tasks contending for the same quota
+    pool (confirmed the hard way: this is exactly what caused the 429/503
+    storm on a single-project run). If this is running as one task of a
+    Cloud Run Job with --tasks N (Cloud Run sets CLOUD_RUN_TASK_INDEX
+    automatically), and a same-indexed GEMINI_API_KEY_<index> secret is
+    configured for a SEPARATE project's key, use that instead of the shared
+    GEMINI_API_KEY — each task then draws from its own independent quota
+    pool. Falls back to plain GEMINI_API_KEY untouched for local runs and
+    single-task jobs, where this env var simply won't be set."""
+    task_index = os.environ.get("CLOUD_RUN_TASK_INDEX")
+    if task_index is None:
+        return
+    per_task_key = os.environ.get(f"GEMINI_API_KEY_{task_index}")
+    if per_task_key:
+        os.environ["GEMINI_API_KEY"] = per_task_key
+
+
+_resolve_gemini_api_key()   # must run before computer_use_extractor/file_date_extractor
+                            # are imported below — both read GEMINI_API_KEY at import time
+
 from provenance_refresh_extractor import _parse_date, classify_url
 from specialized_source_handlers import (
     _GITHUB_TREE_RE, handle_github_tree, normalize_url, classify_blocker,
@@ -49,8 +75,6 @@ from computer_use_extractor import tier1_computer_use
 import verification_recipes as vr
 import bq_io
 import gcs_io
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 LOGS_DIR    = os.path.join(os.path.dirname(__file__), "logs")
 
@@ -364,6 +388,23 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
     print(f"Loaded {len(entities)} entities ({len(unique_urls)} unique candidate URLs across "
           f"sourcedataurl+provenance_url); running {len(entities)}")
 
+    # Multi-task fan-out: when running as one task of a Cloud Run Job with
+    # --tasks N (Cloud Run sets CLOUD_RUN_TASK_INDEX/CLOUD_RUN_TASK_COUNT
+    # automatically in every task's container), each task only processes its
+    # own 1/N slice — paired with _resolve_gemini_api_key() giving each task
+    # its own separate project's Gemini quota, N tasks then run without ever
+    # contending on one shared quota pool (confirmed the hard way: shared
+    # quota + concurrency is exactly what caused the earlier 429/503 storm).
+    # Serial numbers are assigned against the FULL list before slicing, so
+    # they stay globally unique/meaningful across all tasks instead of every
+    # task restarting its own numbering at 1.
+    indexed_entities = list(enumerate(entities, start=start_serial))
+    task_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1"))
+    task_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0"))
+    if task_count > 1:
+        indexed_entities = indexed_entities[task_index::task_count]
+        print(f"Task {task_index}/{task_count}: processing {len(indexed_entities)} of {len(entities)} entities")
+
     global_sem = asyncio.Semaphore(TIER0_CONCURRENCY)
     tier1_sem  = asyncio.Semaphore(TIER1_CONCURRENCY)
     connector = aiohttp.TCPConnector(ssl=False, limit=TIER0_CONCURRENCY)
@@ -388,14 +429,14 @@ async def main(input_csv: str | None, output_csv: str, limit: int | None,
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [process_entity(session, entity, serial, global_sem, tier1_sem,
                                  url_cache, url_cache_lock)
-                 for serial, entity in enumerate(entities, start=start_serial)]
+                 for serial, entity in indexed_entities]
         done = 0
         for coro in asyncio.as_completed(tasks):
             r = await coro
             done += 1
             tier_label = f"T{r['tier']}" if r.get("tier") is not None else "miss"
             shown_url = r.get("url_used") or r.get("url") or ""
-            print(f"  [{done}/{len(entities)}] {tier_label}  {r['date'] or '—':<12}  "
+            print(f"  [{done}/{len(indexed_entities)}] {tier_label}  {r['date'] or '—':<12}  "
                   f"{r.get('object_id', '')[:40]}  {shown_url[:60]}")
 
             log_gcs_uri = ""
