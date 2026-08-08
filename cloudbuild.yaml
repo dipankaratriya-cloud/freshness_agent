@@ -55,8 +55,9 @@ steps:
   # one dedicated worker on its own quota now, so 1 concurrent Tier-1 session
   # per task x 3 tasks = 3 total concurrent, one key each. Each
   # GEMINI_API_KEY_<index> secret must be created ahead of time in Secret
-  # Manager, holding that index's dedicated project's API key — rename the
-  # placeholder secret names below to whatever you actually create.
+  # Manager (currently named literally GEMINI_API_KEY_0/_1/_2, holding that
+  # index's dedicated project's API key) — rename below if you ever create
+  # them under different names.
   # GCS_BUCKET=freshness_logs — bq_io.py/gcs_io.py were redesigned this
   # session around a new Freshness_results table (replacing the older
   # data_freshness_report) and this new per-run-foldered log bucket
@@ -77,7 +78,7 @@ steps:
           --task-timeout 86400 \
           --max-retries 1 \
           --set-env-vars "GCP_PROJECT=datcom-import-dev-768877,BQ_DATASET=dc_kg_dashboard,GCS_BUCKET=freshness_logs,PIPELINE_SOURCE=bq,TIER1_CONCURRENCY=1" \
-          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest,GEMINI_API_KEY_0=gemini-api-key-project-0:latest,GEMINI_API_KEY_1=gemini-api-key-project-1:latest,GEMINI_API_KEY_2=gemini-api-key-project-2:latest" \
+          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest,GEMINI_API_KEY_0=GEMINI_API_KEY_0:latest,GEMINI_API_KEY_1=GEMINI_API_KEY_1:latest,GEMINI_API_KEY_2=GEMINI_API_KEY_2:latest" \
         2>/dev/null || \
         gcloud run jobs create staleness-pipeline-v2 \
           --image "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:$COMMIT_SHA" \
@@ -89,7 +90,7 @@ steps:
           --task-timeout 86400 \
           --max-retries 0 \
           --set-env-vars "GCP_PROJECT=datcom-import-dev-768877,BQ_DATASET=dc_kg_dashboard,GCS_BUCKET=freshness_logs,PIPELINE_SOURCE=bq,TIER1_CONCURRENCY=1" \
-          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest,GEMINI_API_KEY_0=gemini-api-key-project-0:latest,GEMINI_API_KEY_1=gemini-api-key-project-1:latest,GEMINI_API_KEY_2=gemini-api-key-project-2:latest"
+          --set-secrets "GEMINI_API_KEY=staleness-gemini-api-key:latest,GEMINI_API_KEY_0=GEMINI_API_KEY_0:latest,GEMINI_API_KEY_1=GEMINI_API_KEY_1:latest,GEMINI_API_KEY_2=GEMINI_API_KEY_2:latest"
 
 images:
   - "us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/staleness-pipeline-v2/staleness-pipeline-v2:$COMMIT_SHA"
